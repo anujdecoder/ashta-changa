@@ -82,18 +82,28 @@ type Cell struct {
 	playerIdx int
 }
 
+// GameState represents the current state of the game
+type GameState int
+
+const (
+	stateSelectingPlayers GameState = iota
+	statePlaying
+	stateGameOver
+)
+
 // Game represents the game state
 type Game struct {
-	board         *Board
-	conchShells   *ConchShells
-	players       [numPlayers]*Player
-	currentPlayer int
-	rollResult    int
-	hasRolled     bool
-	extraTurn     bool
-	gameOver      bool
-	winner        int
-	clickCooldown int // Prevent multiple clicks
+	state            GameState
+	board            *Board
+	conchShells      *ConchShells
+	players          [4]*Player
+	numActivePlayers int
+	currentPlayer    int
+	rollResult       int
+	hasRolled        bool
+	extraTurn        bool
+	winner           int
+	clickCooldown    int // Prevent multiple clicks
 }
 
 // Path coordinates for the outer path (anti-clockwise)
@@ -304,21 +314,26 @@ func (b *Board) drawStartMarkers(screen *ebiten.Image) {
 
 // NewGame creates a new game instance
 func NewGame() *Game {
-	g := &Game{
+	return &Game{
+		state:       stateSelectingPlayers,
 		board:       NewBoard(),
 		conchShells: NewConchShells(),
-		rollResult:  0,
-		hasRolled:   false,
-		extraTurn:   false,
-		gameOver:    false,
 		winner:      -1,
 	}
+}
 
-	for i := 0; i < numPlayers; i++ {
-		g.players[i] = NewPlayer(i)
+// initGame initializes the game with selected number of players
+func (g *Game) initGame(num int) {
+	g.numActivePlayers = num
+	for i := 0; i < 4; i++ {
+		if i < num {
+			g.players[i] = NewPlayer(i)
+		} else {
+			g.players[i] = nil
+		}
 	}
-
-	return g
+	g.state = statePlaying
+	g.currentPlayer = 0
 }
 
 // canMoveToken checks if a token can be moved with the current roll
@@ -385,6 +400,9 @@ func (g *Game) getValidTokens() []int {
 // moveToken moves a token based on the roll result
 func (g *Game) moveToken(tokenIdx int) {
 	player := g.players[g.currentPlayer]
+	if player == nil {
+		return
+	}
 	token := player.tokens[tokenIdx]
 	roll := g.rollResult
 
@@ -404,13 +422,14 @@ func (g *Game) applyMove(token *Token, roll int) {
 		// On inner path
 		step := token.position - 16
 		newStep := step + roll
-		if newStep == 8 {
+		if newStep >= 8 {
 			token.state = tokenFinished
 			token.position = 24
 			g.extraTurn = true // Rule: Reaching center grants a bonus roll
 			g.checkWin()
 		} else {
 			token.position = 16 + newStep
+			g.checkKill(token) // Rule: Killing possible in inner circle too
 		}
 		return
 	}
@@ -420,13 +439,14 @@ func (g *Game) applyMove(token *Token, roll int) {
 	if roll > distToEntry {
 		// Transition to inner path
 		remaining := roll - distToEntry - 1
-		if remaining == 8 {
+		if remaining >= 8 {
 			token.state = tokenFinished
 			token.position = 24
 			g.extraTurn = true // Rule: Reaching center grants a bonus roll
 			g.checkWin()
 		} else {
 			token.position = 16 + remaining
+			g.checkKill(token) // Rule: Killing possible in inner circle too
 		}
 	} else {
 		// Stay on outer path
@@ -437,13 +457,17 @@ func (g *Game) applyMove(token *Token, roll int) {
 
 // checkKill checks if the moved token lands on an opponent and kills them
 func (g *Game) checkKill(token *Token) {
-	if token.state != tokenOnBoard || token.position >= 16 {
-		return // Only kill on outer path
+	if token.state != tokenOnBoard {
+		return
 	}
 
+	// Get current grid coordinates
+	row, col := g.getCellCoordinates(token)
+
 	// Rule: Starting blocks are safe houses. No killing can happen on a safe house.
-	for _, startPos := range playerStartPositions {
-		if token.position == startPos {
+	for i := 0; i < 4; i++ {
+		startCoords := outerPath[playerStartPositions[i]]
+		if row == startCoords[0] && col == startCoords[1] {
 			return // Safe house, no kill
 		}
 	}
@@ -451,15 +475,18 @@ func (g *Game) checkKill(token *Token) {
 	// Rule: If landing on an opponent's token in a non-safe block, kill it.
 	killedAny := false
 	for _, player := range g.players {
-		if player.idx == token.playerIdx {
-			continue
+		if player == nil || player.idx == token.playerIdx {
+			continue // Cannot kill own tokens or from non-existent players
 		}
 		for _, opponentToken := range player.tokens {
-			if opponentToken.state == tokenOnBoard && opponentToken.position == token.position {
-				// Kill opponent token and send it back to starting point
-				opponentToken.state = tokenAtStart
-				opponentToken.position = playerStartPositions[opponentToken.playerIdx]
-				killedAny = true
+			if opponentToken.state == tokenOnBoard {
+				or, oc := g.getCellCoordinates(opponentToken)
+				if or == row && oc == col {
+					// Kill opponent token and send it back to starting point
+					opponentToken.state = tokenAtStart
+					opponentToken.position = playerStartPositions[opponentToken.playerIdx]
+					killedAny = true
+				}
 			}
 		}
 	}
@@ -472,6 +499,9 @@ func (g *Game) checkKill(token *Token) {
 // checkWin checks if current player has won
 func (g *Game) checkWin() {
 	player := g.players[g.currentPlayer]
+	if player == nil {
+		return
+	}
 	finishedCount := 0
 	for _, token := range player.tokens {
 		if token.state == tokenFinished {
@@ -479,7 +509,7 @@ func (g *Game) checkWin() {
 		}
 	}
 	if finishedCount == tokensPerPlayer {
-		g.gameOver = true
+		g.state = stateGameOver
 		g.winner = g.currentPlayer
 	}
 }
@@ -489,7 +519,7 @@ func (g *Game) nextTurn() {
 	if g.extraTurn {
 		g.extraTurn = false
 	} else {
-		g.currentPlayer = (g.currentPlayer + 1) % numPlayers
+		g.currentPlayer = (g.currentPlayer + 1) % g.numActivePlayers
 	}
 	g.hasRolled = false
 	g.rollResult = 0
@@ -517,18 +547,38 @@ func (g *Game) getCellCoordinates(token *Token) (int, int) {
 
 // Update updates the game state
 func (g *Game) Update() error {
-	if g.gameOver {
-		return nil
-	}
-
 	// Decrease click cooldown
 	if g.clickCooldown > 0 {
 		g.clickCooldown--
+	}
+
+	if g.state == stateSelectingPlayers {
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+			mx, my := ebiten.CursorPosition()
+			// Selection buttons
+			for i := 1; i <= 4; i++ {
+				bx := screenWidth/2 - 100
+				by := 200 + i*60
+				if mx >= bx && mx <= bx+200 && my >= by && my <= by+40 {
+					g.initGame(i)
+					g.clickCooldown = 20
+					break
+				}
+			}
+		}
 		return nil
 	}
 
-	// Handle mouse click
-	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+	if g.state == stateGameOver {
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+			g.state = stateSelectingPlayers
+			g.clickCooldown = 20
+		}
+		return nil
+	}
+
+	// Handle mouse click during playing
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
 		mx, my := ebiten.CursorPosition()
 
 		// Check roll button click
@@ -544,40 +594,31 @@ func (g *Game) Update() error {
 				g.hasRolled = true
 				g.clickCooldown = 10
 
-				// Rule: Rolling a 4 or 8 grants an extra turn
 				if g.rollResult == 4 || g.rollResult == 8 {
 					g.extraTurn = true
 				}
 
-				// Check if player has any valid moves
 				validTokens := g.getValidTokens()
 				if len(validTokens) == 0 {
-					// No valid moves, auto skip turn
 					g.nextTurn()
 				}
 			}
 		}
 
-		// Check token click (only after rolling)
 		if g.hasRolled {
 			validTokens := g.getValidTokens()
 			player := g.players[g.currentPlayer]
 
 			for _, idx := range validTokens {
 				token := player.tokens[idx]
-				
-				// Calculate hit area for token (this is tricky with side-by-side)
-				// For simplicity, we'll check if the click is in the cell where the token is
 				row, col := g.getCellCoordinates(token)
 				tx := boardOffsetX + col*cellSize
 				ty := boardOffsetY + row*cellSize
 				
 				if mx >= tx && mx <= tx+cellSize && my >= ty && my <= ty+cellSize {
-					// Check if this token is actually one of the valid ones
 					g.moveToken(idx)
 					g.clickCooldown = 10
-
-					if !g.gameOver {
+					if g.state == statePlaying {
 						g.nextTurn()
 					}
 					break
@@ -593,62 +634,64 @@ func (g *Game) Update() error {
 func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Fill(color.RGBA{60, 40, 20, 255})
 
+	if g.state == stateSelectingPlayers {
+		g.drawSelectionScreen(screen)
+		return
+	}
+
 	g.board.Draw(screen)
-
-	// Draw tokens
 	g.drawTokens(screen)
-
-	// Draw conch shell area
 	g.drawConchShellArea(screen)
-
-	// Draw current player indicator
 	g.drawPlayerInfo(screen)
 
-	// Draw title
 	ebitenutil.DebugPrintAt(screen, "Ashta Changa - Traditional Indian Board Game", 50, 10)
 
-	// Draw game over message
-	if g.gameOver {
-		ebitenutil.DebugPrintAt(screen, "GAME OVER!", 250, 280)
-		ebitenutil.DebugPrintAt(screen, playerNames[g.winner]+" Wins!", 250, 300)
+	if g.state == stateGameOver {
+		vector.DrawFilledRect(screen, 200, 250, 400, 100, color.RGBA{0, 0, 0, 200}, false)
+		ebitenutil.DebugPrintAt(screen, "GAME OVER!", 350, 280)
+		ebitenutil.DebugPrintAt(screen, playerNames[g.winner]+" Wins!", 350, 300)
+		ebitenutil.DebugPrintAt(screen, "Click anywhere to restart", 320, 330)
+	}
+}
+
+// drawSelectionScreen draws the player selection UI
+func (g *Game) drawSelectionScreen(screen *ebiten.Image) {
+	ebitenutil.DebugPrintAt(screen, "ASHTA CHANGA", screenWidth/2-50, 100)
+	ebitenutil.DebugPrintAt(screen, "Select Number of Players", screenWidth/2-80, 150)
+
+	for i := 1; i <= 4; i++ {
+		bx := screenWidth/2 - 100
+		by := 200 + i*60
+		vector.DrawFilledRect(screen, float32(bx), float32(by), 200, 40, color.RGBA{139, 90, 43, 255}, false)
+		vector.StrokeRect(screen, float32(bx), float32(by), 200, 40, 2, color.RGBA{210, 180, 140, 255}, false)
+		ebitenutil.DebugPrintAt(screen, string(rune('0'+i))+" Players", bx+60, by+12)
 	}
 }
 
 // drawTokens draws all tokens on the board
 func (g *Game) drawTokens(screen *ebiten.Image) {
-	// Group tokens by cell position
 	type pos struct{ r, c int }
 	tokensByCell := make(map[pos][]*Token)
 
 	for _, player := range g.players {
+		if player == nil {
+			continue
+		}
 		for _, token := range player.tokens {
-			if token.state == tokenFinished && token.playerIdx != g.winner {
-				// Only show winner tokens in center or show all? 
-				// Let's show all finished tokens in center
-			}
 			r, c := g.getCellCoordinates(token)
 			p := pos{r, c}
 			tokensByCell[p] = append(tokensByCell[p], token)
 		}
 	}
 
-	// Draw tokens in each cell
 	for cellPos, tokens := range tokensByCell {
 		cellX := boardOffsetX + cellPos.c*cellSize
 		cellY := boardOffsetY + cellPos.r*cellSize
 
-		// Calculate positions for tokens within the cell (up to 16 tokens possible in safe house!)
-		// We'll use a 4x4 grid if needed, or just offset them
 		for i, token := range tokens {
-			// Offset within cell
-			// For 5x5 board and 100px cells, we can fit tokens nicely
 			numInRow := 2
-			if len(tokens) > 4 {
-				numInRow = 3
-			}
-			if len(tokens) > 9 {
-				numInRow = 4
-			}
+			if len(tokens) > 4 { numInRow = 3 }
+			if len(tokens) > 9 { numInRow = 4 }
 
 			offsetX := (i % numInRow) * (cellSize / (numInRow + 1)) + (cellSize / (numInRow + 1))
 			offsetY := (i / numInRow) * (cellSize / (numInRow + 1)) + (cellSize / (numInRow + 1))
@@ -657,8 +700,6 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 			ty := cellY + offsetY
 
 			tokenColor := playerColors[token.playerIdx]
-			
-			// Highlight valid tokens
 			isValid := false
 			if g.hasRolled && token.playerIdx == g.currentPlayer {
 				for _, idx := range g.getValidTokens() {
@@ -670,9 +711,7 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 			}
 
 			radius := float32(12)
-			if numInRow > 2 {
-				radius = 8
-			}
+			if numInRow > 2 { radius = 8 }
 
 			if isValid {
 				vector.StrokeCircle(screen, float32(tx), float32(ty), radius+4, 3, color.RGBA{R: 255, G: 255, B: 255, A: 255}, false)
@@ -681,7 +720,6 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 			vector.DrawFilledCircle(screen, float32(tx), float32(ty), radius, tokenColor, false)
 			vector.StrokeCircle(screen, float32(tx), float32(ty), radius, 2, color.RGBA{R: 0, G: 0, B: 0, A: 255}, false)
 			
-			// Draw token number if not too small
 			if radius >= 10 {
 				numStr := string(rune('1' + token.id))
 				ebitenutil.DebugPrintAt(screen, numStr, tx-3, ty-6)
@@ -692,21 +730,22 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 
 // drawPlayerInfo draws current player and turn information
 func (g *Game) drawPlayerInfo(screen *ebiten.Image) {
+	if g.players[g.currentPlayer] == nil {
+		return
+	}
+	
 	infoX := 600
 	infoY := 550
 
-	// Current player
 	ebitenutil.DebugPrintAt(screen, "Current Player:", infoX, infoY)
 	playerColor := playerColors[g.currentPlayer]
 	vector.DrawFilledRect(screen, float32(infoX+110), float32(infoY), 60, 20, playerColor, false)
 	ebitenutil.DebugPrintAt(screen, playerNames[g.currentPlayer], infoX+115, infoY+2)
 
-	// Extra turn indicator
 	if g.extraTurn {
 		ebitenutil.DebugPrintAt(screen, "EXTRA TURN!", infoX, infoY+25)
 	}
 
-	// Instructions
 	if g.hasRolled {
 		validTokens := g.getValidTokens()
 		if len(validTokens) > 0 {
