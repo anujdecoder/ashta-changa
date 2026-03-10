@@ -1,0 +1,38 @@
+# Build files
+*.wasm
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Binary output
+main
+ashta-changa
+
+# Web build output
+web/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Go specific
+*.test
+*.out
+vendor/
+
+# Temporary files
+tmp/
+temp/
