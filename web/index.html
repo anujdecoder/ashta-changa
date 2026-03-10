@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ashta Changa - Traditional Indian Board Game</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(135deg, #2c1810 0%, #4a3728 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Georgia', serif;
+            color: #f5deb3;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+            font-size: 2.5em;
+            letter-spacing: 2px;
+        }
+
+        #game-container {
+            border: 8px solid #8b4513;
+            border-radius: 10px;
+            box-shadow: 0 0 30px rgba(0, 0, 0, 0.5);
+            background: #654321;
+            padding: 10px;
+        }
+
+        canvas {
+            display: block;
+            background: #f5deb3;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 1.5em;
+            color: #ffd700;
+        }
+
+        .instructions {
+            margin-top: 20px;
+            text-align: center;
+            max-width: 600px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+        }
+
+        .instructions h2 {
+            color: #ffd700;
+            margin-bottom: 10px;
+        }
+
+        .instructions p {
+            line-height: 1.6;
+            font-size: 0.95em;
+        }
+    </style>
+</head>
+<body>
+    <h1>Ashta Changa</h1>
+    <div id="game-container">
+        <div id="loading">Loading game...</div>
+        <canvas id="game" width="600" height="600"></canvas>
+    </div>
+    <div class="instructions">
+        <h2>How to Play</h2>
+        <p>
+            Ashta Changa is a traditional Indian board game similar to Ludo.
+            Roll the conch shells to move your tokens around the board anti-clockwise.
+            Get all four tokens to the golden center to win!
+        </p>
+    </div>
+
+    <script src="wasm_exec.js"></script>
+    <script>
+        const go = new Go();
+        let mod, inst;
+        
+        WebAssembly.instantiateStreaming(fetch("game.wasm"), go.importObject).then((result) => {
+            mod = result.module;
+            inst = result.instance;
+            document.getElementById('loading').style.display = 'none';
+            go.run(inst);
+        }).catch((err) => {
+            console.error(err);
+            document.getElementById('loading').textContent = 'Failed to load game. Please refresh the page.';
+        });
+    </script>
+</body>
+</html>

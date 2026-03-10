@@ -9,9 +9,6 @@
 main
 ashta-changa
 
-# Web build output
-web/
-
 # IDE and editor files
 .idea/
 .vscode/
