@@ -13,28 +13,29 @@ Ashta Changa is an ancient Indian race game that has been played for centuries. 
 3. **Dice**: 4 cowrie shells are used, resulting in values 1-8
 4. **Starting**: Players must roll a 1, 4, or 8 to move a token out of their starting position
 5. **Movement**: Tokens move anti-clockwise around the outer edge, then enter the inner path to reach the center
-6. **Killing**: Landing on an opponent's token sends it back to their starting position
-7. **Bonus Turns**: Rolling a 4, 8, or killing an opponent grants an extra turn
-8. **Winning**: First player to get all 4 tokens to the center wins
+6. **Safe Zones**: Only the starting points (marked with X) are safe zones - tokens cannot be killed there
+7. **Killing**: Landing on an opponent's token sends it back to their home position (not possible on safe zones)
+8. **Bonus Turns**: Rolling a 4, 8, or killing an opponent grants an extra turn
+9. **Winning**: First player to get all 4 tokens to the center wins
 
 ### Board Layout
 
 ```
 +---+---+---+---+---+
-|   |   | X |   |   |  <- X marks starting points
+|   |   | X |   |   |  <- X marks starting points (safe zones)
 +---+---+---+---+---+
-|   |   | S |   |   |  <- S marks safe zones (home columns)
+|   |   | I |   |   |  <- I marks inner paths (not safe)
 +---+---+---+---+---+
-| X | S | G | S | X |  <- G is the goal (center)
+| X | I | G | I | X |  <- G is the goal (center)
 +---+---+---+---+---+
-|   |   | S |   |   |
+|   |   | I |   |   |
 +---+---+---+---+---+
 |   |   | X |   |   |
 +---+---+---+---+---+
 ```
 
-- **X**: Starting points (one for each player)
-- **S**: Safe zones (player-specific paths to center)
+- **X**: Starting points (one for each player) - ONLY safe zones on the board
+- **I**: Inner paths leading to center (not safe - tokens can be killed here)
 - **G**: Goal (golden center block)
 - Outer edge: Movement path
 
@@ -91,12 +92,13 @@ Then open your browser to `http://localhost:3000` (or the port shown).
 This project is under active development. Current features:
 
 - [x] Board rendering with traditional styling
-- [ ] Token placement and movement
-- [ ] Cowrie shell dice rolling
-- [ ] Turn-based gameplay
-- [ ] Token killing mechanics
-- [ ] Win condition detection
-- [ ] Multiplayer support
+- [x] Token placement and movement
+- [x] Cowrie shell dice rolling
+- [x] Turn-based gameplay with 4 players
+- [x] Token killing mechanics
+- [x] Safe zones (starting points only)
+- [x] Extra turn on 4, 8, or killing
+- [x] Win condition detection
 
 ## License
 
