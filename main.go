@@ -119,18 +119,18 @@ var innerPaths = [][2]int{
 
 // Starting positions on the path for each player (index into outerPath)
 var playerStartPositions = []int{
-	2,  // Player 0 (Red) - position 2 on outer path (top center)
-	7,  // Player 1 (Green) - position 7 on outer path (right center)
-	12, // Player 2 (Blue) - position 12 on outer path (bottom center)
-	17, // Player 3 (Orange) - position 17 on outer path (left center)
+	2,  // Player 0 (Red) - position 2 on outer path (0, 2)
+	6,  // Player 1 (Green) - position 6 on outer path (2, 4)
+	10, // Player 2 (Blue) - position 10 on outer path (4, 2)
+	14, // Player 3 (Orange) - position 14 on outer path (2, 0)
 }
 
 // Entry positions to inner path for each player (index into outerPath)
 var playerEntryPositions = []int{
-	1,  // Player 0 (Red) - enters inner after position 1
-	6,  // Player 1 (Green) - enters inner after position 6
-	11, // Player 2 (Blue) - enters inner after position 11
-	16, // Player 3 (Orange) - enters inner after position 16
+	1,  // Player 0 (Red) - enters inner after position 1 (0, 1)
+	5,  // Player 1 (Green) - enters inner after position 5 (1, 4)
+	9,  // Player 2 (Blue) - enters inner after position 9 (4, 3)
+	13, // Player 3 (Orange) - enters inner after position 13 (3, 0)
 }
 
 // NewConchShells creates new conch shells
@@ -413,11 +413,6 @@ func (g *Game) moveToken(tokenIdx int) {
 			g.checkKill(token)
 		}
 	}
-
-	// Check for extra turn (rolled 4 or 8)
-	if roll == 4 || roll == 8 {
-		g.extraTurn = true
-	}
 }
 
 // checkKill checks if the moved token lands on an opponent and kills them
@@ -426,26 +421,31 @@ func (g *Game) checkKill(token *Token) {
 		return
 	}
 
-	// Check if landing on starting position (safe zone)
+	// Rule: Starting blocks are safe houses. No killing can happen on a safe house.
 	for _, startPos := range playerStartPositions {
 		if token.position == startPos {
-			return // Safe zone, no kill
+			return // Safe house, no kill
 		}
 	}
 
-	// Check for opponent tokens at same position
+	// Rule: If landing on an opponent's token in a non-safe block, kill it.
+	killedAny := false
 	for _, player := range g.players {
 		if player.idx == token.playerIdx {
-			continue
+			continue // Cannot kill own tokens
 		}
 		for _, opponentToken := range player.tokens {
 			if opponentToken.state == tokenOnBoard && opponentToken.position == token.position {
-				// Kill opponent token
+				// Kill opponent token and send it back home
 				opponentToken.state = tokenHome
 				opponentToken.position = -1
-				g.extraTurn = true // Extra turn for killing
+				killedAny = true
 			}
 		}
+	}
+
+	if killedAny {
+		g.extraTurn = true // Rule: Killing an opponent's token grants an extra turn
 	}
 }
 
@@ -537,11 +537,16 @@ func (g *Game) Update() error {
 				g.hasRolled = true
 				g.clickCooldown = 10
 
+				// Rule: Rolling a 4 or 8 grants an extra turn
+				if g.rollResult == 4 || g.rollResult == 8 {
+					g.extraTurn = true
+				}
+
 				// Check if player has any valid moves
 				validTokens := g.getValidTokens()
 				if len(validTokens) == 0 {
 					// No valid moves, auto skip turn
-					g.extraTurn = false
+					// Note: if they rolled 4 or 8, nextTurn will stay on them
 					g.nextTurn()
 				}
 			}
