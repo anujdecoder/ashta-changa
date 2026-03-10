@@ -97,40 +97,37 @@ type Game struct {
 }
 
 // Path coordinates for the outer path (anti-clockwise)
-// Total 24 positions on outer path + inner paths
+// Total 16 positions on outer path
 var outerPath = [][2]int{
-	// Top row (left to right)
 	{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 4},
-	// Right column (top to bottom, skip top corner)
 	{1, 4}, {2, 4}, {3, 4},
-	// Bottom row (right to left)
 	{4, 4}, {4, 3}, {4, 2}, {4, 1}, {4, 0},
-	// Left column (bottom to top, skip bottom corner)
 	{3, 0}, {2, 0}, {1, 0},
 }
 
-// Inner path coordinates for each player (path to center)
-var innerPaths = [][2]int{
-	{1, 2}, // Player 0 (Red) - from top
-	{2, 3}, // Player 1 (Green) - from right
-	{3, 2}, // Player 2 (Blue) - from bottom
-	{2, 1}, // Player 3 (Orange) - from left
+// Inner path blocks in clockwise order
+var innerCircle = [][2]int{
+	{1, 1}, {1, 2}, {1, 3}, {2, 3}, {3, 3}, {3, 2}, {3, 1}, {2, 1},
 }
+
+// Starting indices in innerCircle for each player
+var playerInnerStartIndices = []int{0, 2, 4, 6}
 
 // Starting positions on the path for each player (index into outerPath)
 var playerStartPositions = []int{
-	2,  // Player 0 (Red) - position 2 on outer path (0, 2)
-	6,  // Player 1 (Green) - position 6 on outer path (2, 4)
-	10, // Player 2 (Blue) - position 10 on outer path (4, 2)
-	14, // Player 3 (Orange) - position 14 on outer path (2, 0)
+	2,  // Player 0 (Red) - (0, 2)
+	6,  // Player 1 (Green) - (2, 4)
+	10, // Player 2 (Blue) - (4, 2)
+	14, // Player 3 (Orange) - (2, 0)
 }
 
 // Entry positions to inner path for each player (index into outerPath)
+// This is the block JUST BEFORE the starting position
 var playerEntryPositions = []int{
-	1,  // Player 0 (Red) - enters inner after position 1 (0, 1)
-	5,  // Player 1 (Green) - enters inner after position 5 (1, 4)
-	9,  // Player 2 (Blue) - enters inner after position 9 (4, 3)
-	13, // Player 3 (Orange) - enters inner after position 13 (3, 0)
+	1,  // Player 0 (Red) - (0, 1)
+	5,  // Player 1 (Green) - (1, 4)
+	9,  // Player 2 (Blue) - (4, 3)
+	13, // Player 3 (Orange) - (3, 0)
 }
 
 // NewConchShells creates new conch shells
@@ -225,10 +222,10 @@ func NewBoard() *Board {
 		b.cells[y][0].isPath = true
 	}
 
-	b.cells[1][2].isPath = true
-	b.cells[2][3].isPath = true
-	b.cells[3][2].isPath = true
-	b.cells[2][1].isPath = true
+	// Mark inner circle as path
+	for _, coords := range innerCircle {
+		b.cells[coords[0]][coords[1]].isPath = true
+	}
 
 	return b
 }
@@ -340,22 +337,26 @@ func (g *Game) canMoveToken(token *Token, roll int) bool {
 		player := g.players[token.playerIdx]
 		
 		// Check if token is on inner path
-		if token.position >= 24 {
-			// On inner path, can only move if roll gets to center (position 25)
-			if token.position == 24 {
-				return roll == 1 // Need exactly 1 to reach center
+		// position 16-23: steps 0-7 on inner circle
+		if token.position >= 16 {
+			step := token.position - 16
+			if step + roll <= 8 { // 8 means center
+				return true
 			}
 			return false
 		}
 
-		// On outer path - check if would pass entry point
-		// If we've gone around and are approaching entry
-		stepsToEntry := (player.entryPos - token.position + len(outerPath)) % len(outerPath)
+		// On outer path
+		// Check if would pass entry point
+		distToEntry := (player.entryPos - token.position + 16) % 16
 		
-		if stepsToEntry <= roll && stepsToEntry > 0 {
-			// We can enter inner path
-			remaining := roll - stepsToEntry
-			if remaining <= 1 { // Can reach center with remaining steps
+		if roll > distToEntry {
+			// Steps remaining after reaching entry point
+			remaining := roll - distToEntry - 1 // -1 to enter inner circle
+			
+			// After entry point, it enters the inner circle
+			// It then has to complete 8 steps in the circle before center
+			if remaining <= 8 {
 				return true
 			}
 			return false
@@ -388,39 +389,56 @@ func (g *Game) moveToken(tokenIdx int) {
 	roll := g.rollResult
 
 	if token.state == tokenAtStart {
-		// Move token out of starting point
 		token.state = tokenOnBoard
-		token.position = (player.startPos + roll) % len(outerPath)
-		// Check for killing opponent token
-		g.checkKill(token)
+		g.applyMove(token, roll)
 	} else if token.state == tokenOnBoard {
-		// Check if entering inner path
-		stepsToEntry := (player.entryPos - token.position + len(outerPath)) % len(outerPath)
-		
-		if stepsToEntry <= roll && stepsToEntry > 0 {
-			// Enter inner path
-			remaining := roll - stepsToEntry
-			if remaining == 0 {
-				token.position = 24 // Inner path position
-			} else if remaining == 1 {
-				token.state = tokenFinished
-				token.position = 25 // Center
-				g.checkWin()
-			}
+		g.applyMove(token, roll)
+	}
+}
+
+// applyMove applies the roll to a token, handling transitions
+func (g *Game) applyMove(token *Token, roll int) {
+	player := g.players[token.playerIdx]
+
+	if token.position >= 16 {
+		// On inner path
+		step := token.position - 16
+		newStep := step + roll
+		if newStep == 8 {
+			token.state = tokenFinished
+			token.position = 24
+			g.extraTurn = true // Rule: Reaching center grants a bonus roll
+			g.checkWin()
 		} else {
-			// Normal movement on outer path
-			token.position = (token.position + roll) % len(outerPath)
-			
-			// Check for killing opponent token
-			g.checkKill(token)
+			token.position = 16 + newStep
 		}
+		return
+	}
+
+	// On outer path
+	distToEntry := (player.entryPos - token.position + 16) % 16
+	if roll > distToEntry {
+		// Transition to inner path
+		remaining := roll - distToEntry - 1
+		if remaining == 8 {
+			token.state = tokenFinished
+			token.position = 24
+			g.extraTurn = true // Rule: Reaching center grants a bonus roll
+			g.checkWin()
+		} else {
+			token.position = 16 + remaining
+		}
+	} else {
+		// Stay on outer path
+		token.position = (token.position + roll) % 16
+		g.checkKill(token)
 	}
 }
 
 // checkKill checks if the moved token lands on an opponent and kills them
 func (g *Game) checkKill(token *Token) {
-	if token.state != tokenOnBoard || token.position >= len(outerPath) {
-		return
+	if token.state != tokenOnBoard || token.position >= 16 {
+		return // Only kill on outer path
 	}
 
 	// Rule: Starting blocks are safe houses. No killing can happen on a safe house.
@@ -434,7 +452,7 @@ func (g *Game) checkKill(token *Token) {
 	killedAny := false
 	for _, player := range g.players {
 		if player.idx == token.playerIdx {
-			continue // Cannot kill own tokens
+			continue
 		}
 		for _, opponentToken := range player.tokens {
 			if opponentToken.state == tokenOnBoard && opponentToken.position == token.position {
@@ -447,7 +465,7 @@ func (g *Game) checkKill(token *Token) {
 	}
 
 	if killedAny {
-		g.extraTurn = true // Rule: Killing an opponent's token grants an extra turn
+		g.extraTurn = true 
 	}
 }
 
@@ -483,14 +501,16 @@ func (g *Game) getCellCoordinates(token *Token) (int, int) {
 		return 2, 2 // Center block
 	}
 
-	if token.position >= 24 {
+	if token.position >= 16 {
 		// Inner path
 		player := g.players[token.playerIdx]
-		coords := innerPaths[player.idx]
+		step := token.position - 16
+		innerIdx := (playerInnerStartIndices[player.idx] + step) % 8
+		coords := innerCircle[innerIdx]
 		return coords[0], coords[1]
 	}
 
-	// Outer path (includes starting points)
+	// Outer path
 	coords := outerPath[token.position]
 	return coords[0], coords[1]
 }
