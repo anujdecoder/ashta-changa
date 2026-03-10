@@ -36,9 +36,9 @@ var playerNames = []string{"Red", "Green", "Blue", "Orange"}
 type TokenState int
 
 const (
-	tokenHome TokenState = iota // Token is at home (not on board yet)
-	tokenOnBoard                // Token is on the board
-	tokenFinished               // Token has reached the center
+	tokenAtStart TokenState = iota // Token is at starting point (safe house)
+	tokenOnBoard                   // Token is moving on the board
+	tokenFinished                  // Token has reached the center
 )
 
 // Token represents a player's token
@@ -176,8 +176,8 @@ func NewPlayer(idx int) *Player {
 		p.tokens[i] = &Token{
 			id:        i,
 			playerIdx: idx,
-			state:     tokenHome,
-			position:  -1,
+			state:     tokenAtStart,
+			position:  playerStartPositions[idx],
 		}
 	}
 
@@ -330,8 +330,8 @@ func (g *Game) canMoveToken(token *Token, roll int) bool {
 		return false
 	}
 
-	// Token at home - needs 1, 4, or 8 to come out
-	if token.state == tokenHome {
+	// Token at start - needs 1, 4, or 8 to move out
+	if token.state == tokenAtStart {
 		return roll == 1 || roll == 4 || roll == 8
 	}
 
@@ -387,10 +387,12 @@ func (g *Game) moveToken(tokenIdx int) {
 	token := player.tokens[tokenIdx]
 	roll := g.rollResult
 
-	if token.state == tokenHome {
-		// Move token out of home to starting position
+	if token.state == tokenAtStart {
+		// Move token out of starting point
 		token.state = tokenOnBoard
-		token.position = player.startPos
+		token.position = (player.startPos + roll) % len(outerPath)
+		// Check for killing opponent token
+		g.checkKill(token)
 	} else if token.state == tokenOnBoard {
 		// Check if entering inner path
 		stepsToEntry := (player.entryPos - token.position + len(outerPath)) % len(outerPath)
@@ -436,9 +438,9 @@ func (g *Game) checkKill(token *Token) {
 		}
 		for _, opponentToken := range player.tokens {
 			if opponentToken.state == tokenOnBoard && opponentToken.position == token.position {
-				// Kill opponent token and send it back home
-				opponentToken.state = tokenHome
-				opponentToken.position = -1
+				// Kill opponent token and send it back to starting point
+				opponentToken.state = tokenAtStart
+				opponentToken.position = playerStartPositions[opponentToken.playerIdx]
 				killedAny = true
 			}
 		}
@@ -475,37 +477,22 @@ func (g *Game) nextTurn() {
 	g.rollResult = 0
 }
 
-// getScreenPosition returns screen coordinates for a token position
-func (g *Game) getScreenPosition(token *Token) (int, int) {
-	if token.state == tokenHome {
-		// Draw in home area (around the board)
-		player := g.players[token.playerIdx]
-		baseX := boardOffsetX + player.idx*30
-		baseY := boardOffsetY + boardSize*cellSize + 20 + (token.id/2)*25
-		if player.idx >= 2 {
-			baseX = boardOffsetX + (player.idx-2)*30 + boardSize*cellSize/2
-		}
-		return baseX + (token.id%2)*25, baseY
-	}
-
+// getCellCoordinates returns the board grid coordinates for a token
+func (g *Game) getCellCoordinates(token *Token) (int, int) {
 	if token.state == tokenFinished {
-		// Draw near center
-		centerX := boardOffsetX + 2*cellSize + cellSize/2
-		centerY := boardOffsetY + 2*cellSize + cellSize/2
-		offset := 15
-		return centerX + (token.id%2)*offset - offset/2, centerY + (token.id/2)*offset - offset/2
+		return 2, 2 // Center block
 	}
 
 	if token.position >= 24 {
 		// Inner path
 		player := g.players[token.playerIdx]
 		coords := innerPaths[player.idx]
-		return boardOffsetX + coords[1]*cellSize + cellSize/2, boardOffsetY + coords[0]*cellSize + cellSize/2
+		return coords[0], coords[1]
 	}
 
-	// Outer path
+	// Outer path (includes starting points)
 	coords := outerPath[token.position]
-	return boardOffsetX + coords[1]*cellSize + cellSize/2, boardOffsetY + coords[0]*cellSize + cellSize/2
+	return coords[0], coords[1]
 }
 
 // Update updates the game state
@@ -546,7 +533,6 @@ func (g *Game) Update() error {
 				validTokens := g.getValidTokens()
 				if len(validTokens) == 0 {
 					// No valid moves, auto skip turn
-					// Note: if they rolled 4 or 8, nextTurn will stay on them
 					g.nextTurn()
 				}
 			}
@@ -559,10 +545,15 @@ func (g *Game) Update() error {
 
 			for _, idx := range validTokens {
 				token := player.tokens[idx]
-				tx, ty := g.getScreenPosition(token)
 				
-				// Check if click is on this token
-				if mx >= tx-15 && mx <= tx+15 && my >= ty-15 && my <= ty+15 {
+				// Calculate hit area for token (this is tricky with side-by-side)
+				// For simplicity, we'll check if the click is in the cell where the token is
+				row, col := g.getCellCoordinates(token)
+				tx := boardOffsetX + col*cellSize
+				ty := boardOffsetY + row*cellSize
+				
+				if mx >= tx && mx <= tx+cellSize && my >= ty && my <= ty+cellSize {
+					// Check if this token is actually one of the valid ones
 					g.moveToken(idx)
 					g.clickCooldown = 10
 
@@ -605,71 +596,75 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 // drawTokens draws all tokens on the board
 func (g *Game) drawTokens(screen *ebiten.Image) {
-	// Group tokens by position for proper overlapping display
-	type tokenAtPos struct {
-		token *Token
-		x, y  int
-	}
-	
-	var tokensToDraw []tokenAtPos
+	// Group tokens by cell position
+	type pos struct{ r, c int }
+	tokensByCell := make(map[pos][]*Token)
 
 	for _, player := range g.players {
 		for _, token := range player.tokens {
-			if token.state == tokenHome {
-				continue // Draw home tokens separately
+			if token.state == tokenFinished && token.playerIdx != g.winner {
+				// Only show winner tokens in center or show all? 
+				// Let's show all finished tokens in center
 			}
-			x, y := g.getScreenPosition(token)
-			tokensToDraw = append(tokensToDraw, tokenAtPos{token, x, y})
+			r, c := g.getCellCoordinates(token)
+			p := pos{r, c}
+			tokensByCell[p] = append(tokensByCell[p], token)
 		}
 	}
 
-	// Draw tokens on board
-	for _, t := range tokensToDraw {
-		tokenColor := playerColors[t.token.playerIdx]
-		
-		// Highlight valid tokens
-		isValid := false
-		if g.hasRolled && t.token.playerIdx == g.currentPlayer {
-			for _, idx := range g.getValidTokens() {
-				if g.players[g.currentPlayer].tokens[idx] == t.token {
-					isValid = true
-					break
+	// Draw tokens in each cell
+	for cellPos, tokens := range tokensByCell {
+		cellX := boardOffsetX + cellPos.c*cellSize
+		cellY := boardOffsetY + cellPos.r*cellSize
+
+		// Calculate positions for tokens within the cell (up to 16 tokens possible in safe house!)
+		// We'll use a 4x4 grid if needed, or just offset them
+		for i, token := range tokens {
+			// Offset within cell
+			// For 5x5 board and 100px cells, we can fit tokens nicely
+			numInRow := 2
+			if len(tokens) > 4 {
+				numInRow = 3
+			}
+			if len(tokens) > 9 {
+				numInRow = 4
+			}
+
+			offsetX := (i % numInRow) * (cellSize / (numInRow + 1)) + (cellSize / (numInRow + 1))
+			offsetY := (i / numInRow) * (cellSize / (numInRow + 1)) + (cellSize / (numInRow + 1))
+
+			tx := cellX + offsetX
+			ty := cellY + offsetY
+
+			tokenColor := playerColors[token.playerIdx]
+			
+			// Highlight valid tokens
+			isValid := false
+			if g.hasRolled && token.playerIdx == g.currentPlayer {
+				for _, idx := range g.getValidTokens() {
+					if g.players[g.currentPlayer].tokens[idx] == token {
+						isValid = true
+						break
+					}
 				}
 			}
-		}
 
-		if isValid {
-			// Draw highlight ring
-			vector.StrokeCircle(screen, float32(t.x), float32(t.y), 18, 3, color.RGBA{R: 255, G: 255, B: 255, A: 255}, false)
-		}
+			radius := float32(12)
+			if numInRow > 2 {
+				radius = 8
+			}
 
-		vector.DrawFilledCircle(screen, float32(t.x), float32(t.y), 12, tokenColor, false)
-		vector.StrokeCircle(screen, float32(t.x), float32(t.y), 12, 2, color.RGBA{R: 0, G: 0, B: 0, A: 255}, false)
-		
-		// Draw token number
-		numStr := string(rune('1' + t.token.id))
-		ebitenutil.DebugPrintAt(screen, numStr, t.x-3, t.y-6)
-	}
+			if isValid {
+				vector.StrokeCircle(screen, float32(tx), float32(ty), radius+4, 3, color.RGBA{R: 255, G: 255, B: 255, A: 255}, false)
+			}
 
-	// Draw home tokens
-	for _, player := range g.players {
-		homeX := boardOffsetX + player.idx*120
-		homeY := boardOffsetY + boardSize*cellSize + 30
-		
-		// Draw home area background
-		vector.DrawFilledRect(screen, float32(homeX), float32(homeY), 100, 40, playerColors[player.idx], false)
-		vector.StrokeRect(screen, float32(homeX), float32(homeY), 100, 40, 2, color.RGBA{101, 67, 33, 255}, false)
-		
-		ebitenutil.DebugPrintAt(screen, playerNames[player.idx]+":", homeX+5, homeY+5)
-		
-		homeCount := 0
-		for _, token := range player.tokens {
-			if token.state == tokenHome {
-				tx := homeX + 50 + (homeCount%2)*20
-				ty := homeY + 15 + (homeCount/2)*15
-				vector.DrawFilledCircle(screen, float32(tx), float32(ty), 8, playerColors[player.idx], false)
-				vector.StrokeCircle(screen, float32(tx), float32(ty), 8, 1, color.RGBA{0, 0, 0, 255}, false)
-				homeCount++
+			vector.DrawFilledCircle(screen, float32(tx), float32(ty), radius, tokenColor, false)
+			vector.StrokeCircle(screen, float32(tx), float32(ty), radius, 2, color.RGBA{R: 0, G: 0, B: 0, A: 255}, false)
+			
+			// Draw token number if not too small
+			if radius >= 10 {
+				numStr := string(rune('1' + token.id))
+				ebitenutil.DebugPrintAt(screen, numStr, tx-3, ty-6)
 			}
 		}
 	}
@@ -695,7 +690,8 @@ func (g *Game) drawPlayerInfo(screen *ebiten.Image) {
 	if g.hasRolled {
 		validTokens := g.getValidTokens()
 		if len(validTokens) > 0 {
-			ebitenutil.DebugPrintAt(screen, "Click a token to move", infoX, infoY+50)
+			ebitenutil.DebugPrintAt(screen, "Click a cell with your", infoX, infoY+50)
+			ebitenutil.DebugPrintAt(screen, "highlighted token", infoX, infoY+65)
 		}
 	} else {
 		ebitenutil.DebugPrintAt(screen, "Click ROLL to roll shells", infoX, infoY+50)
