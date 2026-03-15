@@ -1,9 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"image/color"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall/js"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
@@ -12,13 +22,13 @@ import (
 )
 
 const (
-	screenWidth  = 800
-	screenHeight = 700
-	boardSize    = 5
-	cellSize     = 100
-	boardOffsetX = 50
-	boardOffsetY = 50
-	numPlayers   = 4
+	screenWidth     = 800
+	screenHeight    = 700
+	boardSize       = 5
+	cellSize        = 100
+	boardOffsetX    = 50
+	boardOffsetY    = 50
+	numPlayers      = 4
 	tokensPerPlayer = 4
 )
 
@@ -32,13 +42,415 @@ var playerColors = []color.RGBA{
 
 var playerNames = []string{"Red", "Green", "Blue", "Orange"}
 
+// Multiplayer related types and constants
+const (
+	stateMenu GameState = iota
+	stateEnterName
+	stateCreateOrJoin
+	stateWaitingRoom
+	stateConnecting
+)
+
+// NetworkClient handles WebSocket connection to the server
+type NetworkClient struct {
+	ws         js.Value
+	serverURL  string
+	playerID   string
+	playerName string
+	roomID     string
+	connected  bool
+	mu         sync.RWMutex
+
+	// Callbacks
+	onRoomCreated     func(room *NetworkRoom, player *NetworkPlayer)
+	onRoomJoined      func(room *NetworkRoom, player *NetworkPlayer)
+	onPlayerJoined    func(player *NetworkPlayer)
+	onPlayerLeft      func(player *NetworkPlayer)
+	onGameStarted     func(gameState *ServerGameState)
+	onGameStateUpdate func(gameState *ServerGameState)
+	onError           func(msg string)
+}
+
+// NetworkRoom represents a game room from server
+type NetworkRoom struct {
+	ID          string           `json:"id"`
+	Name        string           `json:"name"`
+	HostID      string           `json:"hostId"`
+	Players     []*NetworkPlayer `json:"players"`
+	MaxPlayers  int              `json:"maxPlayers"`
+	GameStarted bool             `json:"gameStarted"`
+	CreatedAt   time.Time        `json:"createdAt"`
+}
+
+// NetworkPlayer represents a player from server
+type NetworkPlayer struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	RoomID    string `json:"roomId"`
+	PlayerIdx int    `json:"playerIdx"`
+	IsHost    bool   `json:"isHost"`
+	IsReady   bool   `json:"isReady"`
+}
+
+// ServerGameState represents game state from server
+type ServerGameState struct {
+	CurrentPlayer    int            `json:"currentPlayer"`
+	RollResult       int            `json:"rollResult"`
+	HasRolled        bool           `json:"hasRolled"`
+	ExtraTurn        bool           `json:"extraTurn"`
+	Winner           int            `json:"winner"`
+	PlayerTokens     []PlayerTokens `json:"playerTokens"`
+	NumActivePlayers int            `json:"numActivePlayers"`
+}
+
+// ServerTokenState represents a single token's state from server
+type ServerTokenState struct {
+	ID       int `json:"id"`
+	State    int `json:"state"`
+	Position int `json:"position"`
+}
+
+// PlayerTokens represents a player's tokens state from server
+type PlayerTokens struct {
+	PlayerIdx int                `json:"playerIdx"`
+	Tokens    []ServerTokenState `json:"tokens"`
+}
+
+// Message represents a WebSocket message
+type WSMessage struct {
+	Type    string      `json:"type"`
+	Payload interface{} `json:"payload"`
+}
+
+// NewNetworkClient creates a new network client
+func NewNetworkClient(serverURL string) *NetworkClient {
+	return &NetworkClient{
+		serverURL: serverURL,
+	}
+}
+
+// Connect connects to the WebSocket server
+func (nc *NetworkClient) Connect() error {
+	// Use browser's WebSocket API via syscall/js
+	jsWS := js.Global().Get("WebSocket")
+	if jsWS.IsUndefined() {
+		return fmt.Errorf("WebSockets not supported in this browser")
+	}
+
+	nc.ws = jsWS.New(nc.serverURL)
+
+	// Set up event handlers
+	onOpen := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		nc.mu.Lock()
+		nc.connected = true
+		nc.mu.Unlock()
+		log.Println("WebSocket connected")
+		return nil
+	})
+
+	onMessage := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		data := args[0].Get("data").String()
+		var msg WSMessage
+		if err := json.Unmarshal([]byte(data), &msg); err == nil {
+			nc.handleMessage(msg)
+		}
+		return nil
+	})
+
+	onClose := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		nc.mu.Lock()
+		nc.connected = false
+		nc.mu.Unlock()
+		if nc.onError != nil {
+			nc.onError("Disconnected from server")
+		}
+		return nil
+	})
+
+	onError := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		if nc.onError != nil {
+			nc.onError("Connection error")
+		}
+		return nil
+	})
+
+	nc.ws.Set("onopen", onOpen)
+	nc.ws.Set("onmessage", onMessage)
+	nc.ws.Set("onclose", onClose)
+	nc.ws.Set("onerror", onError)
+
+	// Wait for connection to open (max 5 seconds)
+	start := time.Now()
+	for {
+		nc.mu.RLock()
+		connected := nc.connected
+		nc.mu.RUnlock()
+		if connected {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			return fmt.Errorf("connection timeout")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return nil
+}
+
+// Disconnect closes the connection
+func (nc *NetworkClient) Disconnect() {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+
+	if !nc.ws.IsUndefined() {
+		nc.ws.Call("close")
+		nc.connected = false
+	}
+}
+
+// IsConnected returns connection status
+func (nc *NetworkClient) IsConnected() bool {
+	nc.mu.RLock()
+	defer nc.mu.RUnlock()
+	return nc.connected
+}
+
+// handleMessage handles incoming messages
+func (nc *NetworkClient) handleMessage(msg WSMessage) {
+	payloadBytes, err := json.Marshal(msg.Payload)
+	if err != nil {
+		log.Printf("Error marshaling payload: %v", err)
+		return
+	}
+	log.Printf("Received message type: %s", msg.Type)
+
+	switch msg.Type {
+	case "roomCreated":
+		var resp struct {
+			Room   *NetworkRoom   `json:"room"`
+			Player *NetworkPlayer `json:"player"`
+		}
+		if err := json.Unmarshal(payloadBytes, &resp); err == nil {
+			nc.playerID = resp.Player.ID
+			nc.roomID = resp.Room.ID
+			if nc.onRoomCreated != nil {
+				nc.onRoomCreated(resp.Room, resp.Player)
+			}
+		}
+
+	case "roomJoined":
+		var resp struct {
+			Success bool           `json:"success"`
+			Room    *NetworkRoom   `json:"room"`
+			Player  *NetworkPlayer `json:"player"`
+			Error   string         `json:"error"`
+		}
+		if err := json.Unmarshal(payloadBytes, &resp); err == nil {
+			if resp.Success {
+				nc.playerID = resp.Player.ID
+				nc.roomID = resp.Room.ID
+				if nc.onRoomJoined != nil {
+					nc.onRoomJoined(resp.Room, resp.Player)
+				}
+			} else if nc.onError != nil {
+				nc.onError(resp.Error)
+			}
+		}
+
+	case "playerJoined":
+		var payload struct {
+			Player *NetworkPlayer `json:"player"`
+			Room   *NetworkRoom   `json:"room"`
+		}
+		if err := json.Unmarshal(payloadBytes, &payload); err == nil && nc.onPlayerJoined != nil {
+			nc.onPlayerJoined(payload.Player)
+		}
+
+	case "playerLeft":
+		var player NetworkPlayer
+		if err := json.Unmarshal(payloadBytes, &player); err == nil && nc.onPlayerLeft != nil {
+			nc.onPlayerLeft(&player)
+		}
+
+	case "gameStarted":
+		var gameState ServerGameState
+		if err := json.Unmarshal(payloadBytes, &gameState); err != nil {
+			log.Printf("Error unmarshaling gameStarted: %v", err)
+		} else if nc.onGameStarted != nil {
+			log.Printf("Calling onGameStarted with %d players", gameState.NumActivePlayers)
+			nc.onGameStarted(&gameState)
+		}
+
+	case "gameStateUpdate":
+		var gameState ServerGameState
+		if err := json.Unmarshal(payloadBytes, &gameState); err != nil {
+			log.Printf("Error unmarshaling gameStateUpdate: %v", err)
+		} else if nc.onGameStateUpdate != nil {
+			nc.onGameStateUpdate(&gameState)
+		}
+
+	case "error":
+		var payload struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(payloadBytes, &payload); err == nil && nc.onError != nil {
+			nc.onError(payload.Message)
+		}
+	}
+}
+
+// send sends a message to the server
+func (nc *NetworkClient) send(msg WSMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	nc.ws.Call("send", string(data))
+	return nil
+}
+
+// CreateRoom creates a new room
+func (nc *NetworkClient) CreateRoom(roomName, playerName string) {
+	nc.playerName = playerName
+	nc.send(WSMessage{
+		Type: "createRoom",
+		Payload: map[string]string{
+			"roomName":   roomName,
+			"playerName": playerName,
+		},
+	})
+}
+
+// JoinRoom joins an existing room
+func (nc *NetworkClient) JoinRoom(roomID, playerName string, playerID string) {
+	nc.playerName = playerName
+	nc.roomID = roomID
+	nc.send(WSMessage{
+		Type: "joinRoom",
+		Payload: map[string]string{
+			"roomId":     roomID,
+			"playerName": playerName,
+			"playerId":   playerID,
+		},
+	})
+}
+
+// StartGame starts the game (host only)
+func (nc *NetworkClient) StartGame() {
+	nc.send(WSMessage{
+		Type: "startGame",
+		Payload: map[string]string{
+			"roomId": nc.roomID,
+		},
+	})
+}
+
+// SendGameAction sends a game action to the server
+func (nc *NetworkClient) SendGameAction(action string, tokenIdx int) {
+	nc.send(WSMessage{
+		Type: "gameAction",
+		Payload: map[string]interface{}{
+			"roomId":   nc.roomID,
+			"action":   action,
+			"tokenIdx": tokenIdx,
+		},
+	})
+}
+
+// SetReady sets player ready status
+func (nc *NetworkClient) SetReady(isReady bool) {
+	nc.send(WSMessage{
+		Type: "setReady",
+		Payload: map[string]interface{}{
+			"roomId":  nc.roomID,
+			"isReady": isReady,
+		},
+	})
+}
+
+// getServerURL gets the WebSocket server URL based on current location
+func getServerURL() string {
+	// Check if running in browser
+	doc := js.Global().Get("document")
+	if doc.IsUndefined() {
+		// Not in browser, return default
+		return "ws://localhost:8080/ws"
+	}
+
+	// Get current location
+	location := js.Global().Get("window").Get("location")
+	protocol := location.Get("protocol").String()
+	host := location.Get("host").String()
+
+	// Convert http/https to ws/wss
+	wsProtocol := "ws"
+	if protocol == "https:" {
+		wsProtocol = "wss"
+	}
+
+	// If we're running on localhost (common for development),
+	// assume the backend is on port 8080 as specified in README.
+	if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") {
+		hostName := strings.Split(host, ":")[0]
+		return fmt.Sprintf("%s://%s:8080/ws", wsProtocol, hostName)
+	}
+
+	return fmt.Sprintf("%s://%s/ws", wsProtocol, host)
+}
+
+// getAPIURL gets the REST API URL based on current location
+func getAPIURL() string {
+	doc := js.Global().Get("document")
+	if doc.IsUndefined() {
+		return "http://localhost:8080/api/rooms"
+	}
+
+	location := js.Global().Get("window").Get("location")
+	protocol := location.Get("protocol").String()
+	host := location.Get("host").String()
+
+	// If we're running on localhost, assume the backend is on port 8080
+	if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") {
+		hostName := strings.Split(host, ":")[0]
+		return fmt.Sprintf("http://%s:8080/api/rooms", hostName)
+	}
+
+	return fmt.Sprintf("%s//%s/api/rooms", protocol, host)
+}
+
+// getRoomFromURL gets room ID from URL query parameters
+func getRoomFromURL() string {
+	doc := js.Global().Get("document")
+	if doc.IsUndefined() {
+		return ""
+	}
+
+	location := js.Global().Get("window").Get("location")
+	search := location.Get("search").String()
+
+	// Parse query string
+	if strings.HasPrefix(search, "?") {
+		search = search[1:]
+	}
+
+	pairs := strings.Split(search, "&")
+	for _, pair := range pairs {
+		parts := strings.Split(pair, "=")
+		if len(parts) == 2 && parts[0] == "room" {
+			return parts[1]
+		}
+	}
+
+	return ""
+}
+
 // TokenState represents the state of a token
 type TokenState int
 
 const (
-	tokenAtStart TokenState = iota // Token is at starting point (safe house)
-	tokenOnBoard                   // Token is moving on the board
-	tokenFinished                  // Token has reached the center
+	tokenAtStart  TokenState = iota // Token is at starting point (safe house)
+	tokenOnBoard                    // Token is moving on the board
+	tokenFinished                   // Token has reached the center
 )
 
 // Token represents a player's token
@@ -51,10 +463,10 @@ type Token struct {
 
 // Player represents a player in the game
 type Player struct {
-	idx        int
-	tokens     [tokensPerPlayer]*Token
-	startPos   int // Starting position on the path for this player
-	entryPos   int // Position where token enters inner path
+	idx      int
+	tokens   [tokensPerPlayer]*Token
+	startPos int // Starting position on the path for this player
+	entryPos int // Position where token enters inner path
 }
 
 // ConchShell represents a single conch shell
@@ -86,7 +498,7 @@ type Cell struct {
 type GameState int
 
 const (
-	stateSelectingPlayers GameState = iota
+	stateSelectingPlayers GameState = iota + 5 // Continue from multiplayer states
 	statePlaying
 	stateGameOver
 )
@@ -104,6 +516,20 @@ type Game struct {
 	extraTurn        bool
 	winner           int
 	clickCooldown    int // Prevent multiple clicks
+
+	// Multiplayer fields
+	isMultiplayer    bool
+	networkClient    *NetworkClient
+	currentRoom      *NetworkRoom
+	localPlayer      *NetworkPlayer
+	roomPlayers      []*NetworkPlayer
+	playerName       string
+	inputText        string
+	inputActive      bool
+	joinRoomID       string
+	errorMsg         string
+	showError        bool
+	gameModeSelected bool // true = multiplayer, false = local
 }
 
 // Path coordinates for the outer path (anti-clockwise)
@@ -314,12 +740,19 @@ func (b *Board) drawStartMarkers(screen *ebiten.Image) {
 
 // NewGame creates a new game instance
 func NewGame() *Game {
-	return &Game{
-		state:       stateSelectingPlayers,
+	g := &Game{
+		state:       stateMenu,
 		board:       NewBoard(),
 		conchShells: NewConchShells(),
 		winner:      -1,
 	}
+
+	// Check if there's a room ID in the URL for auto-join
+	if roomID := getRoomFromURL(); roomID != "" {
+		g.joinRoomID = roomID
+	}
+
+	return g
 }
 
 // initGame initializes the game with selected number of players
@@ -350,12 +783,12 @@ func (g *Game) canMoveToken(token *Token, roll int) bool {
 	// Token on board - check if move is valid
 	if token.state == tokenOnBoard {
 		player := g.players[token.playerIdx]
-		
+
 		// Check if token is on inner path
 		// position 16-23: steps 0-7 on inner circle
 		if token.position >= 16 {
 			step := token.position - 16
-			if step + roll <= 8 { // 8 means center
+			if step+roll <= 8 { // 8 means center
 				return true
 			}
 			return false
@@ -364,11 +797,11 @@ func (g *Game) canMoveToken(token *Token, roll int) bool {
 		// On outer path
 		// Check if would pass entry point
 		distToEntry := (player.entryPos - token.position + 16) % 16
-		
+
 		if roll > distToEntry {
 			// Steps remaining after reaching entry point
 			remaining := roll - distToEntry - 1 // -1 to enter inner circle
-			
+
 			// After entry point, it enters the inner circle
 			// It then has to complete 8 steps in the circle before center
 			if remaining <= 8 {
@@ -376,7 +809,7 @@ func (g *Game) canMoveToken(token *Token, roll int) bool {
 			}
 			return false
 		}
-		
+
 		return true
 	}
 
@@ -492,7 +925,7 @@ func (g *Game) checkKill(token *Token) {
 	}
 
 	if killedAny {
-		g.extraTurn = true 
+		g.extraTurn = true
 	}
 }
 
@@ -552,34 +985,197 @@ func (g *Game) Update() error {
 		g.clickCooldown--
 	}
 
-	if g.state == stateSelectingPlayers {
-		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
-			mx, my := ebiten.CursorPosition()
-			// Selection buttons
-			for i := 1; i <= 4; i++ {
-				bx := screenWidth/2 - 100
-				by := 200 + i*60
-				if mx >= bx && mx <= bx+200 && my >= by && my <= by+40 {
-					g.initGame(i)
-					g.clickCooldown = 20
-					break
-				}
-			}
-		}
-		return nil
+	// Handle menu states
+	switch g.state {
+	case stateMenu:
+		return g.updateMenu()
+	case stateEnterName:
+		return g.updateEnterName()
+	case stateCreateOrJoin:
+		return g.updateCreateOrJoin()
+	case stateWaitingRoom:
+		return g.updateWaitingRoom()
+	case stateConnecting:
+		return g.updateConnecting()
+	case stateSelectingPlayers:
+		return g.updateSelectingPlayers()
+	case stateGameOver:
+		return g.updateGameOver()
+	case statePlaying:
+		return g.updatePlaying()
 	}
 
-	if g.state == stateGameOver {
-		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+	return nil
+}
+
+// updateMenu handles the main menu
+func (g *Game) updateMenu() error {
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+		mx, my := ebiten.CursorPosition()
+
+		// Local Game button
+		if g.isButtonClicked(mx, my, screenWidth/2-100, 250, 200, 40) {
+			g.gameModeSelected = false
+			g.isMultiplayer = false
 			g.state = stateSelectingPlayers
 			g.clickCooldown = 20
+			return nil
 		}
-		return nil
+
+		// Multiplayer button
+		if g.isButtonClicked(mx, my, screenWidth/2-100, 320, 200, 40) {
+			g.gameModeSelected = true
+			g.isMultiplayer = true
+			g.state = stateEnterName
+			g.clickCooldown = 20
+			return nil
+		}
 	}
 
+	return nil
+}
+
+// updateEnterName handles the name entry screen
+func (g *Game) updateEnterName() error {
+	// Handle text input
+	g.handleTextInput()
+
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+		mx, my := ebiten.CursorPosition()
+
+		// Continue button
+		if g.isButtonClicked(mx, my, screenWidth/2-100, 400, 200, 40) {
+			if len(g.inputText) > 0 {
+				g.playerName = g.inputText
+				g.state = stateCreateOrJoin
+				g.clickCooldown = 20
+			}
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// updateCreateOrJoin handles the create/join room screen
+func (g *Game) updateCreateOrJoin() error {
+	// Handle text input for room ID
+	g.handleTextInput()
+
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+		mx, my := ebiten.CursorPosition()
+
+		// Create Room button
+		if g.isButtonClicked(mx, my, screenWidth/2-100, 220, 200, 40) {
+			g.initMultiplayer()
+			return nil
+		}
+
+		// Join Room button
+		if g.isButtonClicked(mx, my, screenWidth/2-100, 450, 200, 40) {
+			if len(g.joinRoomID) > 0 {
+				g.initMultiplayer()
+			}
+			return nil
+		}
+
+		// Room ID input area
+		if g.isButtonClicked(mx, my, screenWidth/2-100, 380, 200, 40) {
+			g.inputActive = true
+			g.joinRoomID = ""
+		}
+	}
+
+	return nil
+}
+
+// updateWaitingRoom handles the waiting room screen
+func (g *Game) updateWaitingRoom() error {
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+		mx, my := ebiten.CursorPosition()
+
+		// Start Game button (host only)
+		if g.localPlayer != nil && g.localPlayer.IsHost {
+			if g.isButtonClicked(mx, my, screenWidth/2-100, 500, 200, 40) {
+				if g.networkClient != nil {
+					g.networkClient.StartGame()
+				}
+				g.clickCooldown = 20
+				return nil
+			}
+		}
+
+		// Back button
+		if g.isButtonClicked(mx, my, 50, 600, 100, 40) {
+			if g.networkClient != nil {
+				g.networkClient.Disconnect()
+			}
+			g.state = stateMenu
+			g.clickCooldown = 20
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// updateConnecting handles the connecting screen
+func (g *Game) updateConnecting() error {
+	// Just wait for connection
+	return nil
+}
+
+// updateSelectingPlayers handles local player selection
+func (g *Game) updateSelectingPlayers() error {
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+		mx, my := ebiten.CursorPosition()
+
+		// Back button
+		if g.isButtonClicked(mx, my, 50, 600, 100, 40) {
+			g.state = stateMenu
+			g.clickCooldown = 20
+			return nil
+		}
+
+		// Selection buttons
+		for i := 1; i <= 4; i++ {
+			bx := screenWidth/2 - 100
+			by := 200 + i*60
+			if mx >= bx && mx <= bx+200 && my >= by && my <= by+40 {
+				g.initGame(i)
+				g.clickCooldown = 20
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// updateGameOver handles game over state
+func (g *Game) updateGameOver() error {
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
+		if g.isMultiplayer {
+			g.state = stateWaitingRoom
+		} else {
+			g.state = stateSelectingPlayers
+		}
+		g.clickCooldown = 20
+	}
+	return nil
+}
+
+// updatePlaying handles the playing state
+func (g *Game) updatePlaying() error {
 	// Handle mouse click during playing
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
 		mx, my := ebiten.CursorPosition()
+
+		// In multiplayer, only allow actions on your turn
+		if g.isMultiplayer && g.localPlayer != nil {
+			if g.currentPlayer != g.localPlayer.PlayerIdx {
+				return nil // Not your turn
+			}
+		}
 
 		// Check roll button click
 		shellAreaX := 600
@@ -598,6 +1194,11 @@ func (g *Game) Update() error {
 					g.extraTurn = true
 				}
 
+				// Send action to server in multiplayer
+				if g.isMultiplayer && g.networkClient != nil {
+					g.networkClient.SendGameAction("roll", -1)
+				}
+
 				validTokens := g.getValidTokens()
 				if len(validTokens) == 0 {
 					g.nextTurn()
@@ -614,10 +1215,16 @@ func (g *Game) Update() error {
 				row, col := g.getCellCoordinates(token)
 				tx := boardOffsetX + col*cellSize
 				ty := boardOffsetY + row*cellSize
-				
+
 				if mx >= tx && mx <= tx+cellSize && my >= ty && my <= ty+cellSize {
 					g.moveToken(idx)
 					g.clickCooldown = 10
+
+					// Send action to server in multiplayer
+					if g.isMultiplayer && g.networkClient != nil {
+						g.networkClient.SendGameAction("move", idx)
+					}
+
 					if g.state == statePlaying {
 						g.nextTurn()
 					}
@@ -630,21 +1237,376 @@ func (g *Game) Update() error {
 	return nil
 }
 
+// isButtonClicked checks if a button was clicked
+func (g *Game) isButtonClicked(mx, my, bx, by, bw, bh int) bool {
+	return mx >= bx && mx <= bx+bw && my >= by && my <= by+bh
+}
+
+// handleTextInput handles keyboard text input
+func (g *Game) handleTextInput() {
+	// Handle backspace using inpututil for single press detection
+	if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+		if g.state == stateEnterName && len(g.inputText) > 0 {
+			g.inputText = g.inputText[:len(g.inputText)-1]
+		} else if g.state == stateCreateOrJoin && g.inputActive && len(g.joinRoomID) > 0 {
+			g.joinRoomID = g.joinRoomID[:len(g.joinRoomID)-1]
+		}
+		return
+	}
+
+	// Handle character input
+	chars := ebiten.AppendInputChars(nil)
+	for _, ch := range chars {
+		if ch >= 32 && ch <= 126 { // Printable ASCII
+			if g.state == stateEnterName && len(g.inputText) < 15 {
+				g.inputText += string(ch)
+			} else if g.state == stateCreateOrJoin && g.inputActive && len(g.joinRoomID) < 10 {
+				g.joinRoomID += string(ch)
+			}
+		}
+	}
+}
+
 // Draw renders the game
 func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Fill(color.RGBA{60, 40, 20, 255})
 
-	if g.state == stateSelectingPlayers {
+	switch g.state {
+	case stateMenu:
+		g.drawMenu(screen)
+	case stateEnterName:
+		g.drawEnterName(screen)
+	case stateCreateOrJoin:
+		g.drawCreateOrJoin(screen)
+	case stateWaitingRoom:
+		g.drawWaitingRoom(screen)
+	case stateConnecting:
+		g.drawConnecting(screen)
+	case stateSelectingPlayers:
 		g.drawSelectionScreen(screen)
-		return
+	case statePlaying, stateGameOver:
+		g.drawGame(screen)
 	}
 
+	// Draw error message if any
+	if g.showError {
+		g.drawError(screen)
+	}
+}
+
+// drawMenu draws the main menu
+func (g *Game) drawMenu(screen *ebiten.Image) {
+	ebitenutil.DebugPrintAt(screen, "ASHTA CHANGA", screenWidth/2-50, 100)
+	ebitenutil.DebugPrintAt(screen, "Traditional Indian Board Game", screenWidth/2-100, 130)
+
+	// Local Game button
+	g.drawButton(screen, screenWidth/2-100, 250, 200, 40, "Local Game", color.RGBA{139, 90, 43, 255})
+
+	// Multiplayer button
+	g.drawButton(screen, screenWidth/2-100, 320, 200, 40, "Multiplayer", color.RGBA{139, 90, 43, 255})
+
+	// Instructions
+	ebitenutil.DebugPrintAt(screen, "2-4 Players | Roll shells to move tokens", screenWidth/2-120, 450)
+	ebitenutil.DebugPrintAt(screen, "Reach the center with all 4 tokens to win!", screenWidth/2-130, 470)
+}
+
+// drawEnterName draws the name entry screen
+func (g *Game) drawEnterName(screen *ebiten.Image) {
+	ebitenutil.DebugPrintAt(screen, "ENTER YOUR NAME", screenWidth/2-60, 150)
+
+	// Input box
+	vector.DrawFilledRect(screen, float32(screenWidth/2-150), 250, 300, 50, color.RGBA{200, 200, 200, 255}, false)
+	vector.StrokeRect(screen, float32(screenWidth/2-150), 250, 300, 50, 2, color.RGBA{255, 255, 255, 255}, false)
+
+	// Show input text
+	if len(g.inputText) > 0 {
+		ebitenutil.DebugPrintAt(screen, g.inputText, screenWidth/2-140, 265)
+	} else {
+		ebitenutil.DebugPrintAt(screen, "Type your name...", screenWidth/2-140, 265)
+	}
+
+	// Continue button
+	btnColor := color.RGBA{100, 100, 100, 255}
+	if len(g.inputText) > 0 {
+		btnColor = color.RGBA{139, 90, 43, 255}
+	}
+	g.drawButton(screen, screenWidth/2-100, 400, 200, 40, "Continue", btnColor)
+}
+
+// drawCreateOrJoin draws the create/join room screen
+func (g *Game) drawCreateOrJoin(screen *ebiten.Image) {
+	ebitenutil.DebugPrintAt(screen, "MULTIPLAYER", screenWidth/2-40, 80)
+
+	// Create Room section
+	ebitenutil.DebugPrintAt(screen, "Create a new room:", screenWidth/2-70, 180)
+	g.drawButton(screen, screenWidth/2-100, 220, 200, 40, "Create Room", color.RGBA{139, 90, 43, 255})
+
+	// Divider
+	vector.StrokeLine(screen, float32(screenWidth/2-150), 300, float32(screenWidth/2+150), 300, 2, color.RGBA{150, 150, 150, 255}, false)
+	ebitenutil.DebugPrintAt(screen, "OR", screenWidth/2-10, 310)
+
+	// Join Room section
+	ebitenutil.DebugPrintAt(screen, "Join with Room ID:", screenWidth/2-70, 340)
+
+	// Room ID input box
+	inputColor := color.RGBA{200, 200, 200, 255}
+	if g.inputActive {
+		inputColor = color.RGBA{230, 230, 230, 255}
+	}
+	vector.DrawFilledRect(screen, float32(screenWidth/2-100), 380, 200, 40, inputColor, false)
+	vector.StrokeRect(screen, float32(screenWidth/2-100), 380, 200, 40, 2, color.RGBA{255, 255, 255, 255}, false)
+
+	// Show room ID
+	displayText := g.joinRoomID
+	if len(displayText) == 0 {
+		displayText = "Enter Room ID"
+	}
+	ebitenutil.DebugPrintAt(screen, displayText, screenWidth/2-90, 395)
+
+	// Join button
+	btnColor := color.RGBA{100, 100, 100, 255}
+	if len(g.joinRoomID) > 0 {
+		btnColor = color.RGBA{139, 90, 43, 255}
+	}
+	g.drawButton(screen, screenWidth/2-100, 450, 200, 40, "Join Room", btnColor)
+}
+
+// drawWaitingRoom draws the waiting room screen
+func (g *Game) drawWaitingRoom(screen *ebiten.Image) {
+	ebitenutil.DebugPrintAt(screen, "WAITING ROOM", screenWidth/2-50, 50)
+
+	if g.currentRoom != nil {
+		// Room info
+		ebitenutil.DebugPrintAt(screen, "Room: "+g.currentRoom.Name, 50, 100)
+		ebitenutil.DebugPrintAt(screen, "Room ID: "+g.currentRoom.ID, 50, 120)
+
+		// Share link
+		shareURL := "Share this link: ?room=" + g.currentRoom.ID
+		ebitenutil.DebugPrintAt(screen, shareURL, 50, 150)
+
+		// Players list
+		ebitenutil.DebugPrintAt(screen, "Players:", 50, 200)
+		for i, player := range g.roomPlayers {
+			y := 230 + i*30
+			status := ""
+			if player.IsHost {
+				status = " (Host)"
+			}
+			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%d. %s%s", i+1, player.Name, status), 70, y)
+		}
+
+		// Start Game button (host only)
+		if g.localPlayer != nil && g.localPlayer.IsHost {
+			g.drawButton(screen, screenWidth/2-100, 500, 200, 40, "Start Game", color.RGBA{0, 150, 0, 255})
+			ebitenutil.DebugPrintAt(screen, "Waiting for players...", screenWidth/2-80, 560)
+		} else {
+			ebitenutil.DebugPrintAt(screen, "Waiting for host to start...", screenWidth/2-100, 500)
+		}
+	}
+
+	// Back button
+	g.drawButton(screen, 50, 600, 100, 40, "Back", color.RGBA{139, 90, 43, 255})
+}
+
+// initMultiplayer initializes multiplayer connection
+func (g *Game) initMultiplayer() {
+	g.state = stateConnecting
+
+	go func() {
+		var roomID string
+		var playerID string
+
+		// If creating a room, use HTTP API
+		if g.joinRoomID == "" {
+			apiURL := getAPIURL()
+			reqBody, _ := json.Marshal(map[string]string{
+				"roomName":   g.playerName + "'s Room",
+				"playerName": g.playerName,
+			})
+
+			resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(reqBody))
+			if err != nil {
+				g.handleError("HTTP Error: " + err.Error())
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				g.handleError(fmt.Sprintf("Server Error (%d): %s", resp.StatusCode, string(body)))
+				return
+			}
+
+			var result struct {
+				Room     *NetworkRoom `json:"room"`
+				PlayerID string       `json:"playerId"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				g.handleError("Decode Error: " + err.Error())
+				return
+			}
+
+			roomID = result.Room.ID
+			playerID = result.PlayerID
+		} else {
+			roomID = g.joinRoomID
+		}
+
+		// Connect via WebSocket
+		serverURL := getServerURL()
+		g.networkClient = NewNetworkClient(serverURL)
+
+		// Set up callbacks
+		g.networkClient.onRoomCreated = func(r *NetworkRoom, p *NetworkPlayer) {
+			g.currentRoom = r
+			g.localPlayer = p
+			g.roomPlayers = r.Players
+			g.state = stateWaitingRoom
+		}
+
+		g.networkClient.onRoomJoined = func(r *NetworkRoom, p *NetworkPlayer) {
+			g.currentRoom = r
+			g.localPlayer = p
+			g.roomPlayers = r.Players
+			g.state = stateWaitingRoom
+		}
+
+		g.networkClient.onPlayerJoined = func(p *NetworkPlayer) {
+			g.roomPlayers = append(g.roomPlayers, p)
+		}
+
+		g.networkClient.onPlayerLeft = func(p *NetworkPlayer) {
+			for i, player := range g.roomPlayers {
+				if player.ID == p.ID {
+					g.roomPlayers = append(g.roomPlayers[:i], g.roomPlayers[i+1:]...)
+					break
+				}
+			}
+		}
+
+		g.networkClient.onGameStarted = func(gameState *ServerGameState) {
+			g.startMultiplayerGame(gameState)
+		}
+
+		g.networkClient.onGameStateUpdate = func(gameState *ServerGameState) {
+			g.updateGameStateFromServer(gameState)
+		}
+
+		g.networkClient.onError = func(msg string) {
+			g.handleError(msg)
+		}
+
+		if err := g.networkClient.Connect(); err != nil {
+			g.handleError("Connection Error: " + err.Error())
+			return
+		}
+
+		// Join the room (either the one we just created or the one we want to join)
+		g.networkClient.JoinRoom(roomID, g.playerName, playerID)
+	}()
+}
+
+// handleError handles errors in multiplayer setup
+func (g *Game) handleError(msg string) {
+	g.errorMsg = msg
+	g.showError = true
+	g.state = stateMenu
+}
+
+// startMultiplayerGame starts the game with multiplayer state
+func (g *Game) startMultiplayerGame(serverState *ServerGameState) {
+	log.Printf("Starting multiplayer game with %d players", serverState.NumActivePlayers)
+
+	g.numActivePlayers = serverState.NumActivePlayers
+	g.isMultiplayer = true
+
+	// Initialize players from server state
+	for i := 0; i < g.numActivePlayers; i++ {
+		g.players[i] = NewPlayer(i)
+		// Update player name from room players if available
+		for _, roomPlayer := range g.roomPlayers {
+			if roomPlayer.PlayerIdx == i {
+				playerNames[i] = roomPlayer.Name
+				break
+			}
+		}
+	}
+
+	// Initialize token positions from server state
+	for _, playerTokens := range serverState.PlayerTokens {
+		playerIdx := playerTokens.PlayerIdx
+		if playerIdx < 0 || playerIdx >= g.numActivePlayers || g.players[playerIdx] == nil {
+			continue
+		}
+		for _, tokenState := range playerTokens.Tokens {
+			if tokenState.ID < 0 || tokenState.ID >= tokensPerPlayer {
+				continue
+			}
+			token := g.players[playerIdx].tokens[tokenState.ID]
+			token.state = TokenState(tokenState.State)
+			token.position = tokenState.Position
+		}
+	}
+
+	// Set game state from server
+	g.currentPlayer = serverState.CurrentPlayer
+	g.rollResult = serverState.RollResult
+	g.hasRolled = serverState.HasRolled
+	g.extraTurn = serverState.ExtraTurn
+	g.winner = serverState.Winner
+	g.state = statePlaying
+
+	log.Printf("Multiplayer game started. Current player: %d, State: %d", g.currentPlayer, g.state)
+}
+
+// updateGameStateFromServer updates the game state from server during gameplay
+func (g *Game) updateGameStateFromServer(serverState *ServerGameState) {
+	g.currentPlayer = serverState.CurrentPlayer
+	g.rollResult = serverState.RollResult
+	g.hasRolled = serverState.HasRolled
+	g.extraTurn = serverState.ExtraTurn
+	g.winner = serverState.Winner
+
+	// Update token positions from server
+	for _, playerTokens := range serverState.PlayerTokens {
+		playerIdx := playerTokens.PlayerIdx
+		if playerIdx < 0 || playerIdx >= g.numActivePlayers || g.players[playerIdx] == nil {
+			continue
+		}
+		for _, tokenState := range playerTokens.Tokens {
+			if tokenState.ID < 0 || tokenState.ID >= tokensPerPlayer {
+				continue
+			}
+			token := g.players[playerIdx].tokens[tokenState.ID]
+			token.state = TokenState(tokenState.State)
+			token.position = tokenState.Position
+		}
+	}
+
+	// Check for game over
+	if serverState.Winner >= 0 {
+		g.state = stateGameOver
+	}
+}
+
+// drawConnecting draws the connecting screen
+func (g *Game) drawConnecting(screen *ebiten.Image) {
+	ebitenutil.DebugPrintAt(screen, "CONNECTING...", screenWidth/2-50, screenHeight/2)
+	ebitenutil.DebugPrintAt(screen, "Please wait", screenWidth/2-40, screenHeight/2+30)
+}
+
+// drawGame draws the game board
+func (g *Game) drawGame(screen *ebiten.Image) {
 	g.board.Draw(screen)
 	g.drawTokens(screen)
 	g.drawConchShellArea(screen)
 	g.drawPlayerInfo(screen)
 
-	ebitenutil.DebugPrintAt(screen, "Ashta Changa - Traditional Indian Board Game", 50, 10)
+	title := "Ashta Changa - Traditional Indian Board Game"
+	if g.isMultiplayer {
+		title = "Ashta Changa - Multiplayer"
+	}
+	ebitenutil.DebugPrintAt(screen, title, 50, 10)
 
 	if g.state == stateGameOver {
 		vector.DrawFilledRect(screen, 200, 250, 400, 100, color.RGBA{0, 0, 0, 200}, false)
@@ -652,6 +1614,26 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		ebitenutil.DebugPrintAt(screen, playerNames[g.winner]+" Wins!", 350, 300)
 		ebitenutil.DebugPrintAt(screen, "Click anywhere to restart", 320, 330)
 	}
+}
+
+// drawButton draws a button
+func (g *Game) drawButton(screen *ebiten.Image, x, y, w, h int, label string, bgColor color.RGBA) {
+	vector.DrawFilledRect(screen, float32(x), float32(y), float32(w), float32(h), bgColor, false)
+	vector.StrokeRect(screen, float32(x), float32(y), float32(w), float32(h), 2, color.RGBA{210, 180, 140, 255}, false)
+
+	// Center text
+	textX := x + (w-len(label)*8)/2
+	textY := y + (h-16)/2 + 5
+	ebitenutil.DebugPrintAt(screen, label, textX, textY)
+}
+
+// drawError draws an error message
+func (g *Game) drawError(screen *ebiten.Image) {
+	// Error background
+	vector.DrawFilledRect(screen, 150, 300, 500, 100, color.RGBA{150, 0, 0, 200}, false)
+	ebitenutil.DebugPrintAt(screen, "ERROR", 370, 320)
+	ebitenutil.DebugPrintAt(screen, g.errorMsg, 200, 350)
+	ebitenutil.DebugPrintAt(screen, "Click to dismiss", 330, 380)
 }
 
 // drawSelectionScreen draws the player selection UI
@@ -662,10 +1644,11 @@ func (g *Game) drawSelectionScreen(screen *ebiten.Image) {
 	for i := 1; i <= 4; i++ {
 		bx := screenWidth/2 - 100
 		by := 200 + i*60
-		vector.DrawFilledRect(screen, float32(bx), float32(by), 200, 40, color.RGBA{139, 90, 43, 255}, false)
-		vector.StrokeRect(screen, float32(bx), float32(by), 200, 40, 2, color.RGBA{210, 180, 140, 255}, false)
-		ebitenutil.DebugPrintAt(screen, string(rune('0'+i))+" Players", bx+60, by+12)
+		g.drawButton(screen, bx, by, 200, 40, strconv.Itoa(i)+" Players", color.RGBA{139, 90, 43, 255})
 	}
+
+	// Back button
+	g.drawButton(screen, 50, 600, 100, 40, "Back", color.RGBA{139, 90, 43, 255})
 }
 
 // drawTokens draws all tokens on the board
@@ -690,11 +1673,15 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 
 		for i, token := range tokens {
 			numInRow := 2
-			if len(tokens) > 4 { numInRow = 3 }
-			if len(tokens) > 9 { numInRow = 4 }
+			if len(tokens) > 4 {
+				numInRow = 3
+			}
+			if len(tokens) > 9 {
+				numInRow = 4
+			}
 
-			offsetX := (i % numInRow) * (cellSize / (numInRow + 1)) + (cellSize / (numInRow + 1))
-			offsetY := (i / numInRow) * (cellSize / (numInRow + 1)) + (cellSize / (numInRow + 1))
+			offsetX := (i%numInRow)*(cellSize/(numInRow+1)) + (cellSize / (numInRow + 1))
+			offsetY := (i/numInRow)*(cellSize/(numInRow+1)) + (cellSize / (numInRow + 1))
 
 			tx := cellX + offsetX
 			ty := cellY + offsetY
@@ -711,7 +1698,9 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 			}
 
 			radius := float32(12)
-			if numInRow > 2 { radius = 8 }
+			if numInRow > 2 {
+				radius = 8
+			}
 
 			if isValid {
 				vector.StrokeCircle(screen, float32(tx), float32(ty), radius+4, 3, color.RGBA{R: 255, G: 255, B: 255, A: 255}, false)
@@ -719,7 +1708,7 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 
 			vector.DrawFilledCircle(screen, float32(tx), float32(ty), radius, tokenColor, false)
 			vector.StrokeCircle(screen, float32(tx), float32(ty), radius, 2, color.RGBA{R: 0, G: 0, B: 0, A: 255}, false)
-			
+
 			if radius >= 10 {
 				numStr := string(rune('1' + token.id))
 				ebitenutil.DebugPrintAt(screen, numStr, tx-3, ty-6)
@@ -733,7 +1722,7 @@ func (g *Game) drawPlayerInfo(screen *ebiten.Image) {
 	if g.players[g.currentPlayer] == nil {
 		return
 	}
-	
+
 	infoX := 600
 	infoY := 550
 
