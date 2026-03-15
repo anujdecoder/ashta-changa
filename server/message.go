@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"log"
+	"math/rand"
 	"time"
 )
 
@@ -14,13 +15,13 @@ type Message struct {
 
 // CreateRoomRequest represents a request to create a room
 type CreateRoomRequest struct {
-	RoomName string `json:"roomName"`
+	RoomName   string `json:"roomName"`
 	PlayerName string `json:"playerName"`
 }
 
 // CreateRoomResponse represents a response to create room request
 type CreateRoomResponse struct {
-	Room   *Room  `json:"room"`
+	Room   *Room   `json:"room"`
 	Player *Player `json:"player"`
 }
 
@@ -33,10 +34,10 @@ type JoinRoomRequest struct {
 
 // JoinRoomResponse represents a response to join room request
 type JoinRoomResponse struct {
-	Success bool   `json:"success"`
-	Room    *Room  `json:"room,omitempty"`
+	Success bool    `json:"success"`
+	Room    *Room   `json:"room,omitempty"`
 	Player  *Player `json:"player,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Error   string  `json:"error,omitempty"`
 }
 
 // StartGameRequest represents a request to start the game
@@ -46,9 +47,9 @@ type StartGameRequest struct {
 
 // GameActionRequest represents a game action from a player
 type GameActionRequest struct {
-	RoomID     string `json:"roomId"`
-	Action     string `json:"action"` // "roll", "move"
-	TokenIdx   int    `json:"tokenIdx,omitempty"`
+	RoomID   string `json:"roomId"`
+	Action   string `json:"action"` // "roll", "move"
+	TokenIdx int    `json:"tokenIdx,omitempty"`
 }
 
 // GameStateUpdate represents a game state update
@@ -118,12 +119,12 @@ func handleCreateRoom(client *Client, payload interface{}, roomManager *RoomMana
 	room := roomManager.CreateRoom(req.RoomName, playerID)
 
 	player := &Player{
-		ID:       playerID,
-		Name:     req.PlayerName,
-		RoomID:   room.ID,
-		IsHost:   true,
-		IsReady:  false,
-		Conn:     client,
+		ID:      playerID,
+		Name:    req.PlayerName,
+		RoomID:  room.ID,
+		IsHost:  true,
+		IsReady: false,
+		Conn:    client,
 	}
 
 	room.AddPlayer(player)
@@ -169,14 +170,14 @@ func handleJoinRoom(client *Client, payload interface{}, roomManager *RoomManage
 	if playerID == "" {
 		playerID = generatePlayerID()
 	}
-	
+
 	player := &Player{
-		ID:       playerID,
-		Name:     req.PlayerName,
-		RoomID:   room.ID,
-		IsHost:   playerID == room.HostID,
-		IsReady:  false,
-		Conn:     client,
+		ID:      playerID,
+		Name:    req.PlayerName,
+		RoomID:  room.ID,
+		IsHost:  playerID == room.HostID,
+		IsReady: false,
+		Conn:    client,
 	}
 
 	if !room.AddPlayer(player) {
@@ -278,23 +279,187 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 
 	switch req.Action {
 	case "roll":
-		// Handle roll action - this will be processed by the game logic
-		// For now, broadcast the action to all players
+		room.mu.Lock()
+		if room.GameState.HasRolled {
+			room.mu.Unlock()
+			sendError(client, "Already rolled")
+			return
+		}
+
+		// Roll shells server-side so all clients are in sync
+		shellStates := make([]bool, 4)
+		openCount := 0
+		for i := 0; i < 4; i++ {
+			open := rand.Intn(2) == 1
+			shellStates[i] = open
+			if open {
+				openCount++
+			}
+		}
+
+		rollResult := 0
+		switch openCount {
+		case 0:
+			rollResult = 8
+		case 1:
+			rollResult = 1
+		case 2:
+			rollResult = 2
+		case 3:
+			rollResult = 3
+		case 4:
+			rollResult = 4
+		}
+
+		room.GameState.RollResult = rollResult
+		room.GameState.HasRolled = true
+		room.GameState.ShellStates = shellStates
+		if rollResult == 4 || rollResult == 8 {
+			room.GameState.ExtraTurn = true
+		}
+
+		// Check if current player has all tokens at home (start position)
+		// If so and roll is not 1, 4, or 8, they cannot move - auto-advance turn
+		currentPlayerIdx := room.GameState.CurrentPlayer
+		allAtHome := true
+		for _, pt := range room.GameState.PlayerTokens {
+			if pt.PlayerIdx == currentPlayerIdx {
+				for _, t := range pt.Tokens {
+					if t.State != 0 { // not at start
+						allAtHome = false
+						break
+					}
+				}
+				break
+			}
+		}
+
+		if allAtHome && rollResult != 1 && rollResult != 4 && rollResult != 8 {
+			// Cannot move out - auto-advance turn (no extra turn possible)
+			// Keep roll result/shells visible for this update
+			room.GameState.ExtraTurn = false
+			room.GameState.HasRolled = false
+			room.GameState.CurrentPlayer = (currentPlayerIdx + 1) % room.GameState.NumActivePlayers
+		}
+		room.mu.Unlock()
+
+		// Broadcast full game state update to all players so they sync
 		room.Broadcast(Message{
-			Type: "playerRolled",
-			Payload: map[string]interface{}{
-				"playerIdx": client.player.PlayerIdx,
-			},
+			Type:    "gameStateUpdate",
+			Payload: room.GameState,
 		})
 
 	case "move":
-		// Handle move action
+		// Handle move action - update token state on server
+		room.mu.Lock()
+		if !room.GameState.HasRolled {
+			room.mu.Unlock()
+			sendError(client, "Must roll before moving")
+			return
+		}
+		tokenIdx := req.TokenIdx
+		playerIdx := client.player.PlayerIdx
+
+		// Find and update the token
+		for i, pt := range room.GameState.PlayerTokens {
+			if pt.PlayerIdx == playerIdx {
+				if tokenIdx >= 0 && tokenIdx < len(pt.Tokens) {
+					token := &room.GameState.PlayerTokens[i].Tokens[tokenIdx]
+
+					// Apply move logic (same rules as client)
+					roll := room.GameState.RollResult
+
+					if token.State == 0 { // atStart
+						if roll == 1 || roll == 4 || roll == 8 {
+							token.State = 1 // onBoard
+							// Move from start position on outer path
+							token.Position = (token.Position + roll) % 16
+						} else {
+							room.mu.Unlock()
+							sendError(client, "Invalid move")
+							return
+						}
+					} else if token.State == 1 { // onBoard
+						if token.Position >= 16 {
+							// Inner path
+							step := token.Position - 16
+							if step+roll >= 8 {
+								token.State = 2
+								token.Position = 24
+								room.GameState.ExtraTurn = true
+							} else {
+								token.Position = 16 + step + roll
+							}
+						} else {
+							// Outer path
+							entryPos := playerIdx*4 + 1 // entry is one before start
+							distToEntry := (entryPos - token.Position + 16) % 16
+							if roll > distToEntry {
+								remaining := roll - distToEntry - 1
+								if remaining >= 8 {
+									token.State = 2
+									token.Position = 24
+									room.GameState.ExtraTurn = true
+								} else {
+									token.Position = 16 + remaining
+								}
+							} else {
+								token.Position = (token.Position + roll) % 16
+							}
+						}
+					}
+
+					// Check for kill on outer path (not on safe houses)
+					if token.State == 1 && token.Position < 16 {
+						isSafe := token.Position == 2 || token.Position == 6 ||
+							token.Position == 10 || token.Position == 14
+						if !isSafe {
+							for j, opt := range room.GameState.PlayerTokens {
+								if opt.PlayerIdx != playerIdx {
+									for k, ot := range opt.Tokens {
+										if ot.State == 1 && ot.Position == token.Position {
+											room.GameState.PlayerTokens[j].Tokens[k].State = 0
+											room.GameState.PlayerTokens[j].Tokens[k].Position = opt.PlayerIdx*4 + 2
+											room.GameState.ExtraTurn = true
+										}
+									}
+								}
+							}
+						}
+					}
+
+					// Check win condition
+					allFinished := true
+					for _, t := range room.GameState.PlayerTokens[i].Tokens {
+						if t.State != 2 {
+							allFinished = false
+							break
+						}
+					}
+					if allFinished {
+						room.GameState.Winner = playerIdx
+					}
+				}
+				break
+			}
+		}
+
+		if room.GameState.Winner < 0 {
+			if room.GameState.ExtraTurn {
+				room.GameState.ExtraTurn = false
+			} else {
+				room.GameState.CurrentPlayer = (room.GameState.CurrentPlayer + 1) % room.GameState.NumActivePlayers
+			}
+			room.GameState.HasRolled = false
+			room.GameState.RollResult = 0
+			room.GameState.ShellStates = make([]bool, 4)
+		}
+		room.mu.Unlock()
+
+		// Broadcast full game state update to all players
 		room.Broadcast(Message{
-			Type: "playerMoved",
-			Payload: map[string]interface{}{
-				"playerIdx": client.player.PlayerIdx,
-				"tokenIdx":  req.TokenIdx,
-			},
+			Type:    "gameStateUpdate",
+			Payload: room.GameState,
 		})
 	}
 }

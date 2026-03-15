@@ -97,6 +97,7 @@ type ServerGameState struct {
 	CurrentPlayer    int            `json:"currentPlayer"`
 	RollResult       int            `json:"rollResult"`
 	HasRolled        bool           `json:"hasRolled"`
+	ShellStates      []bool         `json:"shellStates"`
 	ExtraTurn        bool           `json:"extraTurn"`
 	Winner           int            `json:"winner"`
 	PlayerTokens     []PlayerTokens `json:"playerTokens"`
@@ -357,6 +358,18 @@ func (nc *NetworkClient) SendGameAction(action string, tokenIdx int) {
 	})
 }
 
+// SendRollAction sends a roll action request to the server
+func (nc *NetworkClient) SendRollAction() {
+	nc.send(WSMessage{
+		Type: "gameAction",
+		Payload: map[string]interface{}{
+			"roomId":   nc.roomID,
+			"action":   "roll",
+			"tokenIdx": -1,
+		},
+	})
+}
+
 // SetReady sets player ready status
 func (nc *NetworkClient) SetReady(isReady bool) {
 	nc.send(WSMessage{
@@ -442,6 +455,33 @@ func getRoomFromURL() string {
 	}
 
 	return ""
+}
+
+// getRoomURL returns the full shareable room URL
+func getRoomURL(roomID string) string {
+	doc := js.Global().Get("document")
+	if doc.IsUndefined() {
+		return "?room=" + roomID
+	}
+
+	location := js.Global().Get("window").Get("location")
+	origin := location.Get("origin").String()
+	pathname := location.Get("pathname").String()
+	return fmt.Sprintf("%s%s?room=%s", origin, pathname, roomID)
+}
+
+// copyToClipboard copies text to clipboard using browser API
+func copyToClipboard(text string) bool {
+	nav := js.Global().Get("navigator")
+	if nav.IsUndefined() {
+		return false
+	}
+	clipboard := nav.Get("clipboard")
+	if clipboard.IsUndefined() {
+		return false
+	}
+	clipboard.Call("writeText", text)
+	return true
 }
 
 // TokenState represents the state of a token
@@ -530,6 +570,31 @@ type Game struct {
 	errorMsg         string
 	showError        bool
 	gameModeSelected bool // true = multiplayer, false = local
+
+	// Animation fields
+	animRoll     int              // Roll animation counter (0 = idle)
+	animMove     *animMoveState   // Token movement animation
+	animKill     *animKillState   // Kill animation
+	animExtra    int              // Extra turn flash counter
+	lastTokenPos [4][4][2]float64 // Last drawn token screen positions [player][token][x,y]
+}
+
+type animMoveState struct {
+	playerIdx int
+	tokenIdx  int
+	fromX     float64
+	fromY     float64
+	toX       float64
+	toY       float64
+	progress  int // 0-30 frames
+}
+
+type animKillState struct {
+	playerIdx int
+	tokenIdx  int
+	homeX     float64
+	homeY     float64
+	progress  int // 0-30 frames
 }
 
 // Path coordinates for the outer path (anti-clockwise)
@@ -985,6 +1050,9 @@ func (g *Game) Update() error {
 		g.clickCooldown--
 	}
 
+	// Tick animations
+	g.tickAnimations()
+
 	// Handle menu states
 	switch g.state {
 	case stateMenu:
@@ -1006,6 +1074,69 @@ func (g *Game) Update() error {
 	}
 
 	return nil
+}
+
+// tickAnimations updates all active animations
+func (g *Game) tickAnimations() {
+	// Roll animation: spins for 30 frames then stops
+	if g.animRoll > 0 {
+		g.animRoll--
+	}
+
+	// Move animation: progresses from 0 to 30
+	if g.animMove != nil {
+		g.animMove.progress++
+		if g.animMove.progress >= 30 {
+			g.animMove = nil
+		}
+	}
+
+	// Kill animation: progresses from 0 to 30
+	if g.animKill != nil {
+		g.animKill.progress++
+		if g.animKill.progress >= 30 {
+			g.animKill = nil
+		}
+	}
+
+	// Extra turn flash: counts down from 60
+	if g.animExtra > 0 {
+		g.animExtra--
+	}
+}
+
+// startRollAnim starts the pre-roll shell animation
+func (g *Game) startRollAnim() {
+	g.animRoll = 30 // ~0.5 seconds at 60fps
+}
+
+// startMoveAnim starts token movement animation
+func (g *Game) startMoveAnim(playerIdx, tokenIdx int, fromX, fromY, toX, toY float64) {
+	g.animMove = &animMoveState{
+		playerIdx: playerIdx,
+		tokenIdx:  tokenIdx,
+		fromX:     fromX,
+		fromY:     fromY,
+		toX:       toX,
+		toY:       toY,
+		progress:  0,
+	}
+}
+
+// startKillAnim starts kill animation (token returning home)
+func (g *Game) startKillAnim(playerIdx, tokenIdx int, homeX, homeY float64) {
+	g.animKill = &animKillState{
+		playerIdx: playerIdx,
+		tokenIdx:  tokenIdx,
+		homeX:     homeX,
+		homeY:     homeY,
+		progress:  0,
+	}
+}
+
+// startExtraAnim starts extra turn flash
+func (g *Game) startExtraAnim() {
+	g.animExtra = 60 // ~1 second flash
 }
 
 // updateMenu handles the main menu
@@ -1093,6 +1224,15 @@ func (g *Game) updateCreateOrJoin() error {
 func (g *Game) updateWaitingRoom() error {
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && g.clickCooldown == 0 {
 		mx, my := ebiten.CursorPosition()
+
+		// Copy Link button
+		if g.currentRoom != nil && g.isButtonClicked(mx, my, 50, 170, 120, 30) {
+			if roomURL := getRoomURL(g.currentRoom.ID); roomURL != "" {
+				copyToClipboard(roomURL)
+			}
+			g.clickCooldown = 20
+			return nil
+		}
 
 		// Start Game button (host only)
 		if g.localPlayer != nil && g.localPlayer.IsHost {
@@ -1186,17 +1326,24 @@ func (g *Game) updatePlaying() error {
 		if mx >= shellAreaX+20 && mx <= shellAreaX+20+buttonWidth &&
 			my >= buttonY && my <= buttonY+buttonHeight {
 			if !g.hasRolled {
+				// Start pre-roll animation
+				g.startRollAnim()
+
+				// Multiplayer: request roll from server (result comes via gameStateUpdate)
+				if g.isMultiplayer && g.networkClient != nil {
+					g.clickCooldown = 10
+					g.networkClient.SendRollAction()
+					return nil
+				}
+
+				// Local game roll (result shown after anim completes)
 				g.rollResult = g.conchShells.Roll()
 				g.hasRolled = true
 				g.clickCooldown = 10
 
 				if g.rollResult == 4 || g.rollResult == 8 {
 					g.extraTurn = true
-				}
-
-				// Send action to server in multiplayer
-				if g.isMultiplayer && g.networkClient != nil {
-					g.networkClient.SendGameAction("roll", -1)
+					g.startExtraAnim()
 				}
 
 				validTokens := g.getValidTokens()
@@ -1223,6 +1370,7 @@ func (g *Game) updatePlaying() error {
 					// Send action to server in multiplayer
 					if g.isMultiplayer && g.networkClient != nil {
 						g.networkClient.SendGameAction("move", idx)
+						return nil
 					}
 
 					if g.state == statePlaying {
@@ -1380,14 +1528,15 @@ func (g *Game) drawWaitingRoom(screen *ebiten.Image) {
 		ebitenutil.DebugPrintAt(screen, "Room: "+g.currentRoom.Name, 50, 100)
 		ebitenutil.DebugPrintAt(screen, "Room ID: "+g.currentRoom.ID, 50, 120)
 
-		// Share link
-		shareURL := "Share this link: ?room=" + g.currentRoom.ID
+		// Share link with copy button
+		shareURL := "Link: ?room=" + g.currentRoom.ID
 		ebitenutil.DebugPrintAt(screen, shareURL, 50, 150)
+		g.drawButton(screen, 50, 170, 120, 30, "Copy Link", color.RGBA{70, 130, 180, 255})
 
 		// Players list
-		ebitenutil.DebugPrintAt(screen, "Players:", 50, 200)
+		ebitenutil.DebugPrintAt(screen, "Players:", 50, 220)
 		for i, player := range g.roomPlayers {
-			y := 230 + i*30
+			y := 250 + i*30
 			status := ""
 			if player.IsHost {
 				status = " (Host)"
@@ -1554,6 +1703,14 @@ func (g *Game) startMultiplayerGame(serverState *ServerGameState) {
 	g.hasRolled = serverState.HasRolled
 	g.extraTurn = serverState.ExtraTurn
 	g.winner = serverState.Winner
+
+	// Sync shell states for multiplayer
+	if len(serverState.ShellStates) == len(g.conchShells.shells) {
+		for i := range g.conchShells.shells {
+			g.conchShells.shells[i].openSideUp = serverState.ShellStates[i]
+		}
+	}
+
 	g.state = statePlaying
 
 	log.Printf("Multiplayer game started. Current player: %d, State: %d", g.currentPlayer, g.state)
@@ -1566,6 +1723,13 @@ func (g *Game) updateGameStateFromServer(serverState *ServerGameState) {
 	g.hasRolled = serverState.HasRolled
 	g.extraTurn = serverState.ExtraTurn
 	g.winner = serverState.Winner
+
+	// Sync shell states for multiplayer
+	if len(serverState.ShellStates) == len(g.conchShells.shells) {
+		for i := range g.conchShells.shells {
+			g.conchShells.shells[i].openSideUp = serverState.ShellStates[i]
+		}
+	}
 
 	// Update token positions from server
 	for _, playerTokens := range serverState.PlayerTokens {
@@ -1689,10 +1853,12 @@ func (g *Game) drawTokens(screen *ebiten.Image) {
 			tokenColor := playerColors[token.playerIdx]
 			isValid := false
 			if g.hasRolled && token.playerIdx == g.currentPlayer {
-				for _, idx := range g.getValidTokens() {
-					if g.players[g.currentPlayer].tokens[idx] == token {
-						isValid = true
-						break
+				if !g.isMultiplayer || (g.localPlayer != nil && g.currentPlayer == g.localPlayer.PlayerIdx) {
+					for _, idx := range g.getValidTokens() {
+						if g.players[g.currentPlayer].tokens[idx] == token {
+							isValid = true
+							break
+						}
 					}
 				}
 			}
@@ -1726,23 +1892,44 @@ func (g *Game) drawPlayerInfo(screen *ebiten.Image) {
 	infoX := 600
 	infoY := 550
 
-	ebitenutil.DebugPrintAt(screen, "Current Player:", infoX, infoY)
+	// Check if it's local player's turn in multiplayer
+	isMyTurn := !g.isMultiplayer || (g.localPlayer != nil && g.currentPlayer == g.localPlayer.PlayerIdx)
+
+	if isMyTurn {
+		ebitenutil.DebugPrintAt(screen, "YOUR TURN!", infoX, infoY)
+	} else {
+		ebitenutil.DebugPrintAt(screen, "Waiting for:", infoX, infoY)
+	}
+
 	playerColor := playerColors[g.currentPlayer]
 	vector.DrawFilledRect(screen, float32(infoX+110), float32(infoY), 60, 20, playerColor, false)
 	ebitenutil.DebugPrintAt(screen, playerNames[g.currentPlayer], infoX+115, infoY+2)
 
 	if g.extraTurn {
+		// Pulsing animation for extra turn
+		alpha := uint8(255)
+		if g.animExtra > 0 && g.animExtra%10 < 5 {
+			alpha = 100
+		}
+		extraColor := color.RGBA{255, 255, 0, alpha}
+		vector.DrawFilledRect(screen, float32(infoX), float32(infoY+25), 100, 16, extraColor, false)
 		ebitenutil.DebugPrintAt(screen, "EXTRA TURN!", infoX, infoY+25)
 	}
 
 	if g.hasRolled {
 		validTokens := g.getValidTokens()
 		if len(validTokens) > 0 {
-			ebitenutil.DebugPrintAt(screen, "Click a cell with your", infoX, infoY+50)
-			ebitenutil.DebugPrintAt(screen, "highlighted token", infoX, infoY+65)
+			if isMyTurn {
+				ebitenutil.DebugPrintAt(screen, "Click a cell with your", infoX, infoY+50)
+				ebitenutil.DebugPrintAt(screen, "highlighted token", infoX, infoY+65)
+			}
 		}
 	} else {
-		ebitenutil.DebugPrintAt(screen, "Click ROLL to roll shells", infoX, infoY+50)
+		if isMyTurn {
+			ebitenutil.DebugPrintAt(screen, "Click ROLL to roll shells", infoX, infoY+50)
+		} else {
+			ebitenutil.DebugPrintAt(screen, playerNames[g.currentPlayer]+" is rolling...", infoX, infoY+50)
+		}
 	}
 }
 
@@ -1764,13 +1951,21 @@ func (g *Game) drawConchShellArea(screen *ebiten.Image) {
 	for i := 0; i < 4; i++ {
 		shellX := shellAreaX + 40
 		shellY := shellStartY + i*shellSpacing
+		// Pre-roll animation: shake shells
+		if g.animRoll > 0 {
+			shake := float64(g.animRoll%6 - 3) // -3 to +3
+			shellX += int(shake)
+			shellY += int(shake * 0.5)
+		}
 		g.drawConchShell(screen, shellX, shellY, g.conchShells.shells[i].openSideUp)
 	}
 
 	resultY := shellStartY + 4*shellSpacing + 20
 	ebitenutil.DebugPrintAt(screen, "Result:", shellAreaX+60, resultY)
 
-	if g.hasRolled {
+	// Show result only when not animating and have result
+	showResult := g.rollResult > 0 && g.animRoll == 0
+	if showResult {
 		resultText := ""
 		switch g.rollResult {
 		case 8:
@@ -1785,14 +1980,20 @@ func (g *Game) drawConchShellArea(screen *ebiten.Image) {
 		if g.rollResult == 4 || g.rollResult == 8 {
 			ebitenutil.DebugPrintAt(screen, "Bonus Turn!", shellAreaX+55, resultY+40)
 		}
+	} else if g.animRoll > 0 {
+		ebitenutil.DebugPrintAt(screen, "Rolling...", shellAreaX+55, resultY+20)
 	}
 
 	buttonY := resultY + 80
 	buttonWidth := 140
 	buttonHeight := 40
-	buttonColor := color.RGBA{210, 180, 140, 255}
-	if !g.hasRolled {
-		buttonColor = color.RGBA{255, 215, 0, 255}
+	buttonColor := color.RGBA{150, 150, 150, 255} // Grey default
+
+	// Check if it's my turn in multiplayer
+	isMyTurn := !g.isMultiplayer || (g.localPlayer != nil && g.currentPlayer == g.localPlayer.PlayerIdx)
+
+	if !g.hasRolled && isMyTurn {
+		buttonColor = color.RGBA{255, 215, 0, 255} // Gold if can roll
 	}
 	vector.DrawFilledRect(screen, float32(shellAreaX+20), float32(buttonY), float32(buttonWidth), float32(buttonHeight), buttonColor, false)
 	vector.StrokeRect(screen, float32(shellAreaX+20), float32(buttonY), float32(buttonWidth), float32(buttonHeight), 2, color.RGBA{101, 67, 33, 255}, false)
