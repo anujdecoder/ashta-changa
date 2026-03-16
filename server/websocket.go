@@ -8,59 +8,22 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const (
-	// Time allowed to write a message to the peer
-	writeWait = 10 * time.Second
+// Ensure Hub implements HubInterface
+var _ HubInterface = (*Hub)(nil)
 
-	// Time allowed to read the next pong message from the peer
-	pongWait = 60 * time.Second
-
-	// Send pings to peer with this period (must be less than pongWait)
-	pingPeriod = (pongWait * 9) / 10
-
-	// Maximum message size allowed from peer
-	maxMessageSize = 512
-)
+// Ensure Client implements ClientInterface
+var _ ClientInterface = (*Client)(nil)
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	ReadBufferSize:  ReadBufferSize,
+	WriteBufferSize: WriteBufferSize,
 	CheckOrigin: func(r *http.Request) bool {
 		return true // Allow all origins for development
 	},
 }
 
-// Client is a middleman between the WebSocket connection and the hub
-type Client struct {
-	hub *Hub
-
-	// The WebSocket connection
-	conn *websocket.Conn
-
-	// Buffered channel of outbound messages
-	send chan []byte
-
-	// Player info
-	player *Player
-}
-
-// Hub maintains the set of active clients and broadcasts messages to the clients
-type Hub struct {
-	// Registered clients
-	clients map[*Client]bool
-
-	// Register requests from the clients
-	register chan *Client
-
-	// Unregister requests from clients
-	unregister chan *Client
-
-	// Room manager
-	roomManager *RoomManager
-}
-
 // NewHub creates a new hub
-func NewHub(roomManager *RoomManager) *Hub {
+func NewHub(roomManager RoomManagerInterface) *Hub {
 	return &Hub{
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
@@ -87,7 +50,7 @@ func (h *Hub) Run() {
 
 						// Notify other players
 						room.Broadcast(Message{
-							Type:    "playerLeft",
+							Type:    MessageTypePlayerLeft,
 							Payload: client.player,
 						})
 
@@ -103,7 +66,7 @@ func (h *Hub) Run() {
 }
 
 // ServeWs handles WebSocket requests from the peer
-func ServeWs(hub *Hub, roomManager *RoomManager, w http.ResponseWriter, r *http.Request) {
+func ServeWs(hub *Hub, roomManager RoomManagerInterface, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
@@ -113,10 +76,10 @@ func ServeWs(hub *Hub, roomManager *RoomManager, w http.ResponseWriter, r *http.
 	client := &Client{
 		hub:  hub,
 		conn: conn,
-		send: make(chan []byte, 256),
+		send: make(chan []byte, SendChannelSize),
 	}
 
-	client.hub.register <- client
+	hub.Register(client)
 
 	// Allow collection of memory referenced by the caller by doing all work in new goroutines
 	go client.writePump()
@@ -124,16 +87,16 @@ func ServeWs(hub *Hub, roomManager *RoomManager, w http.ResponseWriter, r *http.
 }
 
 // readPump pumps messages from the WebSocket connection to the hub
-func (c *Client) readPump(roomManager *RoomManager) {
+func (c *Client) readPump(roomManager RoomManagerInterface) {
 	defer func() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
 
-	c.conn.SetReadLimit(maxMessageSize)
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetReadLimit(MaxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(PongWait))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.conn.SetReadDeadline(time.Now().Add(PongWait))
 		return nil
 	})
 
@@ -151,9 +114,14 @@ func (c *Client) readPump(roomManager *RoomManager) {
 	}
 }
 
+// ReadPump is the public interface for readPump
+func (c *Client) ReadPump(roomManager RoomManagerInterface) {
+	c.readPump(roomManager)
+}
+
 // writePump pumps messages from the hub to the WebSocket connection
 func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(PingPeriod)
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
@@ -162,7 +130,7 @@ func (c *Client) writePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
 			if !ok {
 				// The hub closed the channel
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
@@ -187,10 +155,35 @@ func (c *Client) writePump() {
 			}
 
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// WritePump is the public interface for writePump
+func (c *Client) WritePump() {
+	c.writePump()
+}
+
+// Send sends data to the client's send channel
+func (c *Client) Send(data []byte) {
+	c.send <- data
+}
+
+// Close closes the client connection
+func (c *Client) Close() {
+	c.conn.Close()
+}
+
+// Register registers a client with the hub
+func (h *Hub) Register(client *Client) {
+	h.register <- client
+}
+
+// Unregister unregisters a client from the hub
+func (h *Hub) Unregister(client *Client) {
+	h.unregister <- client
 }

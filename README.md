@@ -49,24 +49,52 @@ Ashta Changa is an ancient Indian race game that has been played for centuries. 
 
 ```
 .
-├── main.go              # Game logic and board rendering with multiplayer support
-├── go.mod               # Go module definition
-├── go.sum               # Dependency checksums
-├── server/              # Backend server for multiplayer
-│   ├── room.go          # Room management and game state
-│   ├── websocket.go     # WebSocket client handling
-│   ├── message.go       # Message types and handlers
-│   ├── server.go        # HTTP server setup
+├── main.go                    # Minimal entry point (delegates to gui package)
+├── go.mod                     # Go module definition
+├── go.sum                     # Dependency checksums
+├── gui/                       # GUI package (Ebiten-based rendering)
+│   ├── game.go                # Game struct and Ebiten interface implementation
+│   ├── render.go              # All drawing/rendering functions
+│   ├── update.go              # Input handling and game state updates
+│   ├── animation.go           # Animation state management (AnimationManager)
+│   └── interfaces.go          # Renderer interface for testing/mocking
+├── game/                      # Core game logic package (shared between client/server)
+│   ├── types.go               # Token, Player, Board, ConchShells, constants
+│   ├── logic.go               # Game rules, movement, killing, winning logic
+│   └── interfaces.go          # GameLogic interface for testing/mocking
+├── network/                   # Network client package
+│   ├── client.go              # NetworkClient struct and WebSocket methods
+│   ├── types.go               # Network types (NetworkRoom, NetworkPlayer, etc.)
+│   └── interfaces.go          # NetworkClientInterface for testing/mocking
+├── server/                    # Backend server for multiplayer
+│   ├── models.go              # All model types (Room, Player, GameState, etc.)
+│   ├── constants.go           # All constants (WebSocket, game, HTTP)
+│   ├── interfaces.go          # Server interfaces (RoomManager, Hub, etc.)
+│   ├── room.go                # Room management and game state
+│   ├── websocket.go           # WebSocket client handling
+│   ├── message.go             # Message types and handlers
+│   ├── server.go              # HTTP server setup
+│   ├── game_logic_test.go     # Tests for server logic
 │   └── cmd/
-│       └── main.go      # Server entry point
-├── web/
-│   ├── index.html       # HTML page for WebAssembly
-│   ├── game.wasm        # Compiled WebAssembly (generated)
-│   └── wasm_exec.js     # Go WebAssembly runtime
-├── wasm_exec.js         # Go WebAssembly runtime (source)
-├── .gitignore           # Git ignore rules
-└── README.md            # This file
+│       └── main.go            # Server entry point
+├── web/                       # UNCHANGED - WebAssembly assets
+│   ├── index.html             # HTML page for WebAssembly
+│   ├── game.wasm              # Compiled WebAssembly (generated)
+│   └── wasm_exec.js           # Go WebAssembly runtime
+├── .gitignore                 # Git ignore rules
+├── README.md                  # This file
+└── game_rules_test.go         # Tests for game rules (uses game package)
 ```
+
+### Package Descriptions
+
+- **game/**: Core game logic package containing board rules, token movement, killing mechanics, and win conditions. This package is shared between the GUI client and the backend server to ensure consistent game behavior. Includes `GameLogic` interface for mocking in tests.
+
+- **gui/**: Ebiten-based GUI package handling all rendering, input processing, and game state management. Implements the `ebiten.Game` interface. Includes `Renderer` interface for testing rendering logic and `AnimationManager` for handling animations.
+
+- **network/**: Network client package for WebSocket communication with the backend server. Contains all multiplayer networking code. Includes `NetworkClientInterface` for mocking network calls in tests.
+
+- **server/**: Backend HTTP/WebSocket server for multiplayer gameplay. Handles room management, player connections, and game state synchronization. Uses interfaces (`RoomManagerInterface`, `HubInterface`, etc.) for better testability and abstraction.
 
 ## Building and Running
 
@@ -230,6 +258,54 @@ This project is under active development. Current features:
 - **Host Controls**: Only the host can start the game
 - **Player Names**: Each player can set their custom name
 - **Max Players**: Up to 4 players per room
+
+## Code Organization & Refactoring
+
+This project has been refactored to improve code organization, testability, and maintainability.
+
+### Refactoring Changes
+
+1. **Clear Package Structure**: Separated code into distinct packages:
+   - `game/` - Core game logic (shared between client and server)
+   - `gui/` - Ebiten GUI code (rendering, input handling)
+   - `network/` - WebSocket client code
+   - `server/` - Backend server (unchanged structure)
+
+2. **Broken into Multiple Files**: Large monolithic files split into focused modules:
+   - `gui/game.go` - Game struct and Ebiten interface
+   - `gui/render.go` - All drawing functions
+   - `gui/update.go` - All input/update handling
+   - `game/types.go` - Types and constants
+   - `game/logic.go` - Game rules and mechanics
+   - `network/client.go` - Network client methods
+   - `network/types.go` - Network types
+
+3. **Shared Game Logic**: The `game/` package is now used by both the GUI client and backend server, eliminating code duplication for:
+   - Roll calculation (`RollFromShellStates`)
+   - Board creation (`NewBoard`)
+   - Token movement validation (`CanMoveToken`)
+   - Kill checking (`CheckKill`)
+   - Win condition (`CheckWin`)
+
+4. **Minimal Entry Point**: `main.go` is now minimal (~20 lines) and delegates to the `gui` package.
+
+### Future Improvements (TODO)
+
+The following improvements can be taken up in subsequent development:
+
+- [x] **Add GameLogic Interface**: Create `GameLogic` interface in `game/` package to allow for mocking in tests
+- [x] **Add Renderer Interface**: Create `Renderer` interface in `gui/` package for testing rendering logic
+- [x] **Add NetworkClient Interface**: Create `NetworkClient` interface in `network/` package for mocking network calls
+- [x] **Extract Animation Logic**: Move animation state management to a separate `animation.go` file
+- [ ] **Add Board Interface**: Create `Board` interface for different board configurations
+- [ ] **Improve Error Handling**: Add structured error types instead of string messages
+- [ ] **Add Game State History**: Implement undo/redo functionality for game states
+- [x] **Extract Constants**: Move all magic numbers to a `constants.go` file (completed in server/)
+- [ ] **Add Logging Package**: Create a centralized logging package
+- [ ] **Add Configuration**: Support configuration via environment variables or config file
+- [ ] **Improve Test Coverage**: Add more unit tests for edge cases in game logic
+- [ ] **Add Benchmarks**: Add benchmark tests for performance-critical paths
+- [ ] **Document APIs**: Add godoc comments to all exported functions
 
 ## License
 

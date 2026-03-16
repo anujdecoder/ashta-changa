@@ -10,7 +10,7 @@ import (
 // Server represents the game server
 type Server struct {
 	hub         *Hub
-	roomManager *RoomManager
+	roomManager RoomManagerInterface
 	port        string
 }
 
@@ -35,16 +35,16 @@ func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
 	// WebSocket endpoint
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(WebSocketEndpoint, func(w http.ResponseWriter, r *http.Request) {
 		ServeWs(s.hub, s.roomManager, w, r)
 	})
 
 	// API endpoints
-	mux.HandleFunc("/api/rooms", s.handleRooms)
-	mux.HandleFunc("/api/room/", s.handleRoom)
+	mux.HandleFunc(APIRoomsEndpoint, s.handleRooms)
+	mux.HandleFunc(APIRoomEndpointPrefix, s.handleRoom)
 
 	// Health check
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(HealthEndpoint, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
@@ -54,21 +54,21 @@ func (s *Server) Start() error {
 
 	addr := ":" + s.port
 	log.Printf("Starting server on %s", addr)
-	log.Printf("WebSocket endpoint: ws://localhost%s/ws", addr)
-	log.Printf("API endpoint: http://localhost%s/api/rooms", addr)
+	log.Printf("WebSocket endpoint: ws://localhost%s%s", addr, WebSocketEndpoint)
+	log.Printf("API endpoint: http://localhost%s%s", addr, APIRoomsEndpoint)
 
 	return http.ListenAndServe(addr, handler)
 }
 
 // handleRooms handles room list requests
 func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", ContentTypeJSON)
 
 	switch r.Method {
-	case http.MethodGet:
+	case MethodGet:
 		rooms := s.roomManager.ListRooms()
 		json.NewEncoder(w).Encode(rooms)
-	case http.MethodPost:
+	case MethodPost:
 		var req struct {
 			RoomName   string `json:"roomName"`
 			PlayerName string `json:"playerName"`
@@ -93,10 +93,10 @@ func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
 
 // handleRoom handles individual room requests
 func (s *Server) handleRoom(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", ContentTypeJSON)
 
 	// Extract room ID from URL path
-	roomID := r.URL.Path[len("/api/room/"):]
+	roomID := r.URL.Path[len(APIRoomEndpointPrefix):]
 
 	room, exists := s.roomManager.GetRoom(roomID)
 	if !exists {
@@ -105,7 +105,7 @@ func (s *Server) handleRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch r.Method {
-	case http.MethodGet:
+	case MethodGet:
 		json.NewEncoder(w).Encode(room)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -115,11 +115,11 @@ func (s *Server) handleRoom(w http.ResponseWriter, r *http.Request) {
 // withCORS adds CORS headers to responses
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set(CORSOriginHeader, CORSAllowAll)
+		w.Header().Set(CORSMethodsHeader, CORSAllowedMethods)
+		w.Header().Set(CORSHeadersHeader, CORSAllowedHeaders)
 
-		if r.Method == "OPTIONS" {
+		if r.Method == MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
 		}

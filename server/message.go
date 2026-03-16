@@ -5,82 +5,27 @@ import (
 	"log"
 	"math/rand"
 	"time"
+
+	"github.com/anujdecoder/ashta-board/game"
 )
-
-// Message represents a WebSocket message
-type Message struct {
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload"`
-}
-
-// CreateRoomRequest represents a request to create a room
-type CreateRoomRequest struct {
-	RoomName   string `json:"roomName"`
-	PlayerName string `json:"playerName"`
-}
-
-// CreateRoomResponse represents a response to create room request
-type CreateRoomResponse struct {
-	Room   *Room   `json:"room"`
-	Player *Player `json:"player"`
-}
-
-// JoinRoomRequest represents a request to join a room
-type JoinRoomRequest struct {
-	RoomID     string `json:"roomId"`
-	PlayerName string `json:"playerName"`
-	PlayerID   string `json:"playerId,omitempty"`
-}
-
-// JoinRoomResponse represents a response to join room request
-type JoinRoomResponse struct {
-	Success bool    `json:"success"`
-	Room    *Room   `json:"room,omitempty"`
-	Player  *Player `json:"player,omitempty"`
-	Error   string  `json:"error,omitempty"`
-}
-
-// StartGameRequest represents a request to start the game
-type StartGameRequest struct {
-	RoomID string `json:"roomId"`
-}
-
-// GameActionRequest represents a game action from a player
-type GameActionRequest struct {
-	RoomID   string `json:"roomId"`
-	Action   string `json:"action"` // "roll", "move"
-	TokenIdx int    `json:"tokenIdx,omitempty"`
-}
-
-// GameStateUpdate represents a game state update
-type GameStateUpdate struct {
-	GameState *GameState `json:"gameState"`
-}
-
-// PlayerJoinedPayload represents payload for player joined event
-type PlayerJoinedPayload struct {
-	Player *Player `json:"player"`
-	Room   *Room   `json:"room"`
-}
 
 // generatePlayerID generates a unique player ID
 func generatePlayerID() string {
-	return time.Now().Format("20060102150405") + randomString(6)
+	return time.Now().Format(PlayerIDTimestampFormat) + randomString(RandomStringLength)
 }
 
 // randomString generates a random string of given length
 func randomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
 	for i := range b {
-		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+		b[i] = PlayerIDCharset[time.Now().UnixNano()%int64(len(PlayerIDCharset))]
 		time.Sleep(1 * time.Nanosecond)
 	}
 	return string(b)
 }
 
 // handleMessage handles incoming WebSocket messages
-func handleMessage(client *Client, data []byte, roomManager *RoomManager) {
+func handleMessage(client *Client, data []byte, roomManager RoomManagerInterface) {
 	var msg Message
 	if err := json.Unmarshal(data, &msg); err != nil {
 		log.Printf("Error unmarshaling message: %v", err)
@@ -107,7 +52,7 @@ func handleMessage(client *Client, data []byte, roomManager *RoomManager) {
 }
 
 // handleCreateRoom handles room creation
-func handleCreateRoom(client *Client, payload interface{}, roomManager *RoomManager) {
+func handleCreateRoom(client *Client, payload interface{}, roomManager RoomManagerInterface) {
 	payloadBytes, _ := json.Marshal(payload)
 	var req CreateRoomRequest
 	if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -131,7 +76,7 @@ func handleCreateRoom(client *Client, payload interface{}, roomManager *RoomMana
 	client.player = player
 
 	response := Message{
-		Type: "roomCreated",
+		Type: MessageTypeRoomCreated,
 		Payload: CreateRoomResponse{
 			Room:   room,
 			Player: player,
@@ -142,7 +87,7 @@ func handleCreateRoom(client *Client, payload interface{}, roomManager *RoomMana
 }
 
 // handleJoinRoom handles joining a room
-func handleJoinRoom(client *Client, payload interface{}, roomManager *RoomManager) {
+func handleJoinRoom(client *Client, payload interface{}, roomManager RoomManagerInterface) {
 	payloadBytes, _ := json.Marshal(payload)
 	var req JoinRoomRequest
 	if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -189,7 +134,7 @@ func handleJoinRoom(client *Client, payload interface{}, roomManager *RoomManage
 
 	// Send success response to joining player
 	response := Message{
-		Type: "roomJoined",
+		Type: MessageTypeRoomJoined,
 		Payload: JoinRoomResponse{
 			Success: true,
 			Room:    room,
@@ -200,7 +145,7 @@ func handleJoinRoom(client *Client, payload interface{}, roomManager *RoomManage
 
 	// Notify other players
 	room.BroadcastToOthers(player.ID, Message{
-		Type: "playerJoined",
+		Type: MessageTypePlayerJoined,
 		Payload: PlayerJoinedPayload{
 			Player: player,
 			Room:   room,
@@ -209,7 +154,7 @@ func handleJoinRoom(client *Client, payload interface{}, roomManager *RoomManage
 }
 
 // handleStartGame handles starting the game
-func handleStartGame(client *Client, payload interface{}, roomManager *RoomManager) {
+func handleStartGame(client *Client, payload interface{}, roomManager RoomManagerInterface) {
 	payloadBytes, _ := json.Marshal(payload)
 	var req StartGameRequest
 	if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -233,7 +178,7 @@ func handleStartGame(client *Client, payload interface{}, roomManager *RoomManag
 	if room.GameStarted {
 		// Just send the current game state to this player
 		sendMessage(client, Message{
-			Type:    "gameStarted",
+			Type:    MessageTypeGameStarted,
 			Payload: room.GameState,
 		})
 		return
@@ -246,13 +191,13 @@ func handleStartGame(client *Client, payload interface{}, roomManager *RoomManag
 
 	// Broadcast game started to all players
 	room.Broadcast(Message{
-		Type:    "gameStarted",
+		Type:    MessageTypeGameStarted,
 		Payload: room.GameState,
 	})
 }
 
 // handleGameAction handles game actions (roll, move)
-func handleGameAction(client *Client, payload interface{}, roomManager *RoomManager) {
+func handleGameAction(client *Client, payload interface{}, roomManager RoomManagerInterface) {
 	payloadBytes, _ := json.Marshal(payload)
 	var req GameActionRequest
 	if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -278,7 +223,7 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 	}
 
 	switch req.Action {
-	case "roll":
+	case ActionRoll:
 		room.mu.Lock()
 		if room.GameState.HasRolled {
 			room.mu.Unlock()
@@ -287,29 +232,13 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 		}
 
 		// Roll shells server-side so all clients are in sync
-		shellStates := make([]bool, 4)
-		openCount := 0
-		for i := 0; i < 4; i++ {
-			open := rand.Intn(2) == 1
-			shellStates[i] = open
-			if open {
-				openCount++
-			}
+		shellStates := make([]bool, DefaultMaxPlayers)
+		for i := 0; i < DefaultMaxPlayers; i++ {
+			shellStates[i] = rand.Intn(2) == 1
 		}
 
-		rollResult := 0
-		switch openCount {
-		case 0:
-			rollResult = 8
-		case 1:
-			rollResult = 1
-		case 2:
-			rollResult = 2
-		case 3:
-			rollResult = 3
-		case 4:
-			rollResult = 4
-		}
+		// Use game package for roll result calculation
+		rollResult := game.RollFromShellStates(shellStates)
 
 		room.GameState.RollResult = rollResult
 		room.GameState.HasRolled = true
@@ -318,15 +247,30 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 			room.GameState.ExtraTurn = true
 		}
 
-		// Check if current player has all tokens at home (start position)
-		// If so and roll is not 1, 4, or 8, they cannot move - auto-advance turn
+		// Check if current player has any valid token moves
+		// If no valid moves possible, auto-advance turn
 		currentPlayerIdx := room.GameState.CurrentPlayer
-		allAtHome := true
+		hasValidMove := false
+
+		// Find current player's tokens
 		for _, pt := range room.GameState.PlayerTokens {
 			if pt.PlayerIdx == currentPlayerIdx {
+				// Create a temporary player for CanMoveToken check
+				tempPlayer := &game.Player{
+					Idx:      currentPlayerIdx,
+					StartPos: game.PlayerStartPositions[currentPlayerIdx],
+					EntryPos: game.PlayerEntryPositions[currentPlayerIdx],
+				}
 				for _, t := range pt.Tokens {
-					if t.State != 0 { // not at start
-						allAtHome = false
+					// Create a temporary token for CanMoveToken check
+					tempToken := &game.Token{
+						ID:        t.ID,
+						PlayerIdx: currentPlayerIdx,
+						State:     game.TokenState(t.State),
+						Position:  t.Position,
+					}
+					if game.CanMoveToken(tempToken, rollResult, tempPlayer) {
+						hasValidMove = true
 						break
 					}
 				}
@@ -334,8 +278,8 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 			}
 		}
 
-		if allAtHome && rollResult != 1 && rollResult != 4 && rollResult != 8 {
-			// Cannot move out - auto-advance turn (no extra turn possible)
+		if !hasValidMove {
+			// No valid moves - auto-advance turn (no extra turn possible)
 			// Keep roll result/shells visible for this update
 			room.GameState.ExtraTurn = false
 			room.GameState.HasRolled = false
@@ -345,11 +289,11 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 
 		// Broadcast full game state update to all players so they sync
 		room.Broadcast(Message{
-			Type:    "gameStateUpdate",
+			Type:    MessageTypeGameStateUpdate,
 			Payload: room.GameState,
 		})
 
-	case "move":
+	case ActionMove:
 		// Handle move action - update token state on server
 		room.mu.Lock()
 		if !room.GameState.HasRolled {
@@ -369,9 +313,9 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 					// Apply move logic (same rules as client)
 					roll := room.GameState.RollResult
 
-					if token.State == 0 { // atStart
+					if token.State == TokenStateAtStart { // atStart
 						if roll == 1 || roll == 4 || roll == 8 {
-							token.State = 1 // onBoard
+							token.State = TokenStateOnBoard // onBoard
 							// Move from start position on outer path
 							token.Position = (token.Position + roll) % 16
 						} else {
@@ -379,12 +323,12 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 							sendError(client, "Invalid move")
 							return
 						}
-					} else if token.State == 1 { // onBoard
+					} else if token.State == TokenStateOnBoard { // onBoard
 						if token.Position >= 16 {
 							// Inner path
 							step := token.Position - 16
 							if step+roll >= 8 {
-								token.State = 2
+								token.State = TokenStateFinished
 								token.Position = 24
 								room.GameState.ExtraTurn = true
 							} else {
@@ -397,7 +341,7 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 							if roll > distToEntry {
 								remaining := roll - distToEntry - 1
 								if remaining >= 8 {
-									token.State = 2
+									token.State = TokenStateFinished
 									token.Position = 24
 									room.GameState.ExtraTurn = true
 								} else {
@@ -409,17 +353,22 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 						}
 					}
 
-					// Check for kill on outer path (not on safe houses)
-					if token.State == 1 && token.Position < 16 {
-						isSafe := token.Position == 2 || token.Position == 6 ||
-							token.Position == 10 || token.Position == 14
+					// Check for kill on outer path and inner edge (not on safe houses)
+					if token.State == TokenStateOnBoard {
+						isSafe := false
+						// Safe houses are only on outer path at positions 2, 6, 10, 14
+						if token.Position < 16 {
+							isSafe = token.Position == 2 || token.Position == 6 ||
+								token.Position == 10 || token.Position == 14
+						}
+						// Inner edge (position >= 16) has no safe houses
 						if !isSafe {
 							for j, opt := range room.GameState.PlayerTokens {
 								if opt.PlayerIdx != playerIdx {
 									for k, ot := range opt.Tokens {
-										if ot.State == 1 && ot.Position == token.Position {
-											room.GameState.PlayerTokens[j].Tokens[k].State = 0
-											room.GameState.PlayerTokens[j].Tokens[k].Position = opt.PlayerIdx*4 + 2
+										if ot.State == TokenStateOnBoard && ot.Position == token.Position {
+											room.GameState.PlayerTokens[j].Tokens[k].State = TokenStateAtStart
+											room.GameState.PlayerTokens[j].Tokens[k].Position = opt.PlayerIdx*DefaultMaxPlayers + 2
 											room.GameState.ExtraTurn = true
 										}
 									}
@@ -431,7 +380,7 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 					// Check win condition
 					allFinished := true
 					for _, t := range room.GameState.PlayerTokens[i].Tokens {
-						if t.State != 2 {
+						if t.State != TokenStateFinished {
 							allFinished = false
 							break
 						}
@@ -452,30 +401,30 @@ func handleGameAction(client *Client, payload interface{}, roomManager *RoomMana
 			}
 			room.GameState.HasRolled = false
 			room.GameState.RollResult = 0
-			room.GameState.ShellStates = make([]bool, 4)
+			room.GameState.ShellStates = make([]bool, DefaultMaxPlayers)
 		}
 		room.mu.Unlock()
 
 		// Broadcast full game state update to all players
 		room.Broadcast(Message{
-			Type:    "gameStateUpdate",
+			Type:    MessageTypeGameStateUpdate,
 			Payload: room.GameState,
 		})
 	}
 }
 
 // handleGetRooms handles getting list of rooms
-func handleGetRooms(client *Client, roomManager *RoomManager) {
+func handleGetRooms(client *Client, roomManager RoomManagerInterface) {
 	rooms := roomManager.ListRooms()
 	response := Message{
-		Type:    "roomsList",
+		Type:    MessageTypeRoomsList,
 		Payload: rooms,
 	}
 	sendMessage(client, response)
 }
 
 // handleSetReady handles player ready status
-func handleSetReady(client *Client, payload interface{}, roomManager *RoomManager) {
+func handleSetReady(client *Client, payload interface{}, roomManager RoomManagerInterface) {
 	payloadBytes, _ := json.Marshal(payload)
 	var req struct {
 		RoomID  string `json:"roomId"`
@@ -497,7 +446,7 @@ func handleSetReady(client *Client, payload interface{}, roomManager *RoomManage
 
 		// Notify all players about ready status change
 		room.Broadcast(Message{
-			Type: "playerReady",
+			Type: MessageTypePlayerReady,
 			Payload: map[string]interface{}{
 				"playerId": client.player.ID,
 				"isReady":  req.IsReady,
@@ -519,7 +468,7 @@ func sendMessage(client *Client, msg Message) {
 // sendError sends an error message to a client
 func sendError(client *Client, errorMsg string) {
 	msg := Message{
-		Type: "error",
+		Type: MessageTypeError,
 		Payload: map[string]string{
 			"message": errorMsg,
 		},

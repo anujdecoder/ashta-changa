@@ -2,65 +2,14 @@ package server
 
 import (
 	"encoding/json"
-	"sync"
 	"time"
 )
 
-// Room represents a game room where players can join and play together
-type Room struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	HostID      string     `json:"hostId"`
-	Players     []*Player  `json:"players"`
-	MaxPlayers  int        `json:"maxPlayers"`
-	GameStarted bool       `json:"gameStarted"`
-	GameState   *GameState `json:"gameState"`
-	CreatedAt   time.Time  `json:"createdAt"`
+// Ensure RoomManager implements RoomManagerInterface
+var _ RoomManagerInterface = (*RoomManager)(nil)
 
-	mu sync.RWMutex
-}
-
-// Player represents a player in a room
-type Player struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	RoomID    string  `json:"roomId"`
-	PlayerIdx int     `json:"playerIdx"` // 0-3 for the 4 players in game
-	IsHost    bool    `json:"isHost"`
-	IsReady   bool    `json:"isReady"`
-	Conn      *Client `json:"-"` // WebSocket connection
-}
-
-// GameState represents the current state of the game
-type GameState struct {
-	CurrentPlayer    int            `json:"currentPlayer"`
-	RollResult       int            `json:"rollResult"`
-	HasRolled        bool           `json:"hasRolled"`
-	ShellStates      []bool         `json:"shellStates"`
-	ExtraTurn        bool           `json:"extraTurn"`
-	Winner           int            `json:"winner"`
-	PlayerTokens     []PlayerTokens `json:"playerTokens"`
-	NumActivePlayers int            `json:"numActivePlayers"`
-}
-
-// PlayerTokens represents a player's tokens state
-type PlayerTokens struct {
-	PlayerIdx int          `json:"playerIdx"`
-	Tokens    []TokenState `json:"tokens"`
-}
-
-// TokenState represents the state of a single token
-type TokenState struct {
-	ID       int `json:"id"`
-	State    int `json:"state"` // 0=atStart, 1=onBoard, 2=finished
-	Position int `json:"position"`
-}
-
-// RoomManager manages all game rooms
-type RoomManager struct {
-	rooms map[string]*Room
-	mu    sync.RWMutex
-}
+// Ensure Room implements RoomInterface
+var _ RoomInterface = (*Room)(nil)
 
 // NewRoomManager creates a new room manager
 func NewRoomManager() *RoomManager {
@@ -80,12 +29,12 @@ func (rm *RoomManager) CreateRoom(name, hostID string) *Room {
 		Name:       name,
 		HostID:     hostID,
 		Players:    make([]*Player, 0),
-		MaxPlayers: 4,
+		MaxPlayers: DefaultMaxPlayers,
 		GameState: &GameState{
 			CurrentPlayer:    0,
 			RollResult:       0,
 			HasRolled:        false,
-			ShellStates:      make([]bool, 4),
+			ShellStates:      make([]bool, DefaultMaxPlayers),
 			ExtraTurn:        false,
 			Winner:           -1,
 			PlayerTokens:     make([]PlayerTokens, 0),
@@ -209,20 +158,20 @@ func (r *Room) StartGame() bool {
 	r.GameState.ExtraTurn = false
 	r.GameState.Winner = -1
 	r.GameState.PlayerTokens = make([]PlayerTokens, 0)
-	r.GameState.ShellStates = make([]bool, 4)
+	r.GameState.ShellStates = make([]bool, DefaultMaxPlayers)
 
 	// Initialize player tokens - starting positions are center safe houses (not corners)
 	// Player 0: position 2, Player 1: position 6, Player 2: position 10, Player 3: position 14
 	for _, player := range r.Players {
 		pt := PlayerTokens{
 			PlayerIdx: player.PlayerIdx,
-			Tokens:    make([]TokenState, 4),
+			Tokens:    make([]TokenState, DefaultMaxPlayers),
 		}
-		startPos := player.PlayerIdx*4 + 2 // Center safe house positions: 2, 6, 10, 14
-		for i := 0; i < 4; i++ {
+		startPos := player.PlayerIdx*DefaultMaxPlayers + 2 // Center safe house positions: 2, 6, 10, 14
+		for i := 0; i < DefaultMaxPlayers; i++ {
 			pt.Tokens[i] = TokenState{
 				ID:       i,
-				State:    0, // atStart
+				State:    TokenStateAtStart,
 				Position: startPos,
 			}
 		}
@@ -268,10 +217,9 @@ func (r *Room) BroadcastToOthers(senderID string, msg interface{}) {
 
 // generateRoomID generates a unique room ID
 func generateRoomID() string {
-	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-	b := make([]byte, 6)
+	b := make([]byte, RoomIDLength)
 	for i := range b {
-		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+		b[i] = RoomIDCharset[time.Now().UnixNano()%int64(len(RoomIDCharset))]
 		time.Sleep(1 * time.Nanosecond)
 	}
 	return string(b)
